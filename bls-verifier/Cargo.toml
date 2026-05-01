@@ -1,0 +1,11 @@
+[package]
+name = "bls-verifier"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+blst = "0.3"
+sha2 = "0.10"

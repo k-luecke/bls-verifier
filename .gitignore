@@ -1,0 +1,6 @@
+# Per O-700 / R.01 — sources only, build artifacts reproducible.
+target/
+Cargo.lock
+*.so
+*.dylib
+*.dll

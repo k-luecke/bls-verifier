@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "bls-verifier",
+    "bls-test",
+    "bls-verify-cli",
+]

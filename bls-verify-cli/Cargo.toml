@@ -1,0 +1,9 @@
+[package]
+name = "bls-verify-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+blst = "0.3"
+sha2 = "0.10"
+serde_json = "1"
