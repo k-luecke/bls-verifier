@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "record-fixture"
 path = "src/bin/record_fixture.rs"
 
+[[bin]]
+name = "bls-device-harness"
+path = "src/bin/harness.rs"
+
 [dependencies]
 blst = "0.3"
 sha2 = "0.10"
