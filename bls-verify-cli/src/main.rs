@@ -33,11 +33,26 @@ fn main() {
         }
     }
 
-    // Compute domain and signing root
+    // Compute domain and signing root.
+    // Per O-701 / S.06 the fork version is supplied by the caller (the
+    // HyperBEAM device fetches it dynamically). The CLI accepts it as an
+    // input field so this stays a pure function over byte buffers.
     let genesis_validators_root = hex_to_bytes(
         "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
     );
-    let domain = compute_domain(&genesis_validators_root);
+    let fork_version_hex = data["fork_version"]
+        .as_str()
+        .expect("fork_version field is required (4-byte hex, e.g. \"0x06000000\")")
+        .trim_start_matches("0x");
+    let fork_version = hex_to_bytes(fork_version_hex);
+    if fork_version.len() != 4 {
+        println!("{}", serde_json::json!({
+            "verified": false,
+            "error": format!("fork_version must be 4 bytes, got {}", fork_version.len())
+        }));
+        return;
+    }
+    let domain = compute_domain(&fork_version, &genesis_validators_root);
     let parent_root_bytes = hex_to_bytes(parent_root_hex);
     let signing_root = compute_signing_root(&parent_root_bytes, &domain);
 
@@ -80,11 +95,10 @@ fn main() {
     }
 }
 
-fn compute_domain(genesis_validators_root: &[u8]) -> Vec<u8> {
+fn compute_domain(fork_version: &[u8], genesis_validators_root: &[u8]) -> Vec<u8> {
     let domain_type = [0x07, 0x00, 0x00, 0x00];
-    let fork_version = [0x06, 0x00, 0x00, 0x00];
     let mut chunk1 = [0u8; 32];
-    chunk1[..4].copy_from_slice(&fork_version);
+    chunk1[..4].copy_from_slice(fork_version);
     let mut chunk2 = [0u8; 32];
     chunk2.copy_from_slice(genesis_validators_root);
     let mut combined = Vec::new();

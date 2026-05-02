@@ -107,7 +107,12 @@ async fn main() {
     let genesis_validators_root = hex_to_bytes(
         "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
     );
-    let domain = compute_domain(&genesis_validators_root);
+
+    // Fetch fork_version dynamically per O-701 / S.06. No hardcoded version.
+    let fork_version = fetch_fork_version(&client, &slot).await;
+    println!("Fork version: 0x{}", bytes_to_hex(&fork_version));
+
+    let domain = compute_domain(&fork_version, &genesis_validators_root);
     println!("Domain: {}", bytes_to_hex(&domain));
 
     let parent_root_bytes = hex_to_bytes(&parent_root);
@@ -132,12 +137,23 @@ async fn main() {
     }
 }
 
-fn compute_domain(genesis_validators_root: &[u8]) -> Vec<u8> {
+async fn fetch_fork_version(client: &reqwest::Client, slot: &str) -> Vec<u8> {
+    let url = format!(
+        "https://lodestar-mainnet.chainsafe.io/eth/v1/beacon/states/{}/fork",
+        slot
+    );
+    let resp = client.get(&url).send().await.unwrap()
+        .json::<Value>().await.unwrap();
+    let s = resp["data"]["current_version"].as_str()
+        .expect("beacon /fork response missing current_version");
+    hex_to_bytes(s.trim_start_matches("0x"))
+}
+
+fn compute_domain(fork_version: &[u8], genesis_validators_root: &[u8]) -> Vec<u8> {
     let domain_type = [0x07, 0x00, 0x00, 0x00];
-    let fork_version = [0x06, 0x00, 0x00, 0x00];
 
     let mut chunk1 = [0u8; 32];
-    chunk1[..4].copy_from_slice(&fork_version);
+    chunk1[..4].copy_from_slice(fork_version);
 
     let mut chunk2 = [0u8; 32];
     chunk2.copy_from_slice(genesis_validators_root);

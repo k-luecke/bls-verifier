@@ -8,4 +8,3 @@ crate-type = ["cdylib"]
 
 [dependencies]
 blst = "0.3"
-sha2 = "0.10"
