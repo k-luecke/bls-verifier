@@ -115,6 +115,37 @@ curl -sX POST http://localhost:8080/v1/sync-committee/verify \
 Expected: `verified: true` for a real recent slot. This is the operator proof
 of the A-120 / S.02 gate.
 
+## O-702 / S.05a — Institutional pattern: regression tests that close bug *classes*
+
+> **CA.02 hook.** This is an instance of a broader claim Paxiom makes about
+> itself — that we close bug classes, not just bugs. When the CA-Series
+> compliance architecture sheet on regression discipline gets written
+> (currently filed as CA.02), it should reference this section as the
+> canonical worked example.
+
+The hardcoded Fulu fork version (`[0x06, 0x00, 0x00, 0x00]`) was a textbook
+small bug. Every BLS-on-Ethereum implementation has shipped one at some
+point. The fix — fetch the fork version dynamically per O-701 / S.06 — is
+unremarkable.
+
+The institutional move was `bls-device/tests/no_hardcoded_fork.rs`: a
+workspace test that walks every `src/` directory and fails the build if any
+file outside `tests/` and `fixtures/` contains the four-byte literal in any
+of its common spelling variants. Future hardcodes do not pass review; they
+fail CI. The class is closed.
+
+The same pattern should be applied wherever Paxiom catches a "this team has
+shipped this bug before" failure mode:
+- Hardcoded chain ids
+- Hardcoded contract addresses across networks
+- Hardcoded RPC endpoints in source (the no-RPC moat must hold at compile-time)
+- Hardcoded process ids that shift on AO process redeployment
+
+Each of these warrants a sibling to `no_hardcoded_fork.rs`. The tests are
+cheap to write, never break under refactor (they grep, they don't compile),
+and they show up to anyone reading the repo as evidence that the team
+designs out problems instead of fixing them on incident review.
+
 ## O-702 / S.06 — Tests
 
 | Layer                      | Command                                          | Where it runs |
