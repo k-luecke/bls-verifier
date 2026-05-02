@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "record-fixture"
 path = "src/bin/record_fixture.rs"
 
+[[bin]]
+name = "bls-device-harness"
+path = "src/bin/harness.rs"
+
 [dependencies]
 blst = "0.3"
 sha2 = "0.10"
@@ -24,6 +28,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 thiserror = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
