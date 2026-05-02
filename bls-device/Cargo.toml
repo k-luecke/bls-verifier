@@ -1,0 +1,30 @@
+[package]
+name = "bls-device"
+version = "0.1.0"
+edition = "2021"
+description = "HyperBEAM device harness for the BLS sync committee primitive (O-701)."
+
+[lib]
+name = "bls_device"
+path = "src/lib.rs"
+
+[[bin]]
+name = "record-fixture"
+path = "src/bin/record_fixture.rs"
+
+[dependencies]
+blst = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+async-trait = "0.1"
+thiserror = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

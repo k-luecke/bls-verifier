@@ -1,8 +1,10 @@
 # O-701 — HyperBEAM BLS Device (sketch)
 
-> **Status:** sketch / 2026-04-30 / Rev. 0
+> **Status:** scaffolded / 2026-05-02 / Rev. 1 (was sketch / 2026-04-30 / Rev. 0)
 > **Predecessor:** [O-700 — BLS Sync Committee Primitive](O-700-bls-sync-committee-primitive.md)
+> **Successor:** [O-702 — BLS Device Runbook](O-702-bls-device-runbook.md) — operator runbook for the implemented harness
 > **Service:** Paxiom A-202 — Sync Committee Verification
+> **Implementation:** [`bls-device/`](../bls-device) — Phase 0 scaffolding lands all eight pipeline stages with mock x402/AO defaults; live facilitator and AO writers are filed as follow-ups (see implementation status below).
 
 The production verifier. Wraps the [`bls-verifier` cdylib](../bls-verifier)
 primitive with the network plumbing, fork awareness, and AO/x402
@@ -263,6 +265,29 @@ miss: < 7s (degrades gracefully).
 3. **OPEN:** decide host-vs-wasm signing-root computation (S.08).
 4. **OPEN:** define platform signing-key rotation (referenced as
    future runbook O-720).
+
+## O-701 / S.12 — Implementation status (2026-05-02)
+
+Phase 0 scaffolding lives in [`bls-device/`](../bls-device). Source-file map
+of the eight pipeline stages:
+
+| Stage | Source file (`bls-device/src/`)                | Status                                   |
+|-------|------------------------------------------------|------------------------------------------|
+| S.01  | `lib.rs::Device::verify` parse path            | Done                                     |
+| S.02  | `x402.rs::MockX402`                            | Stub default; real Coinbase impl TODO    |
+| S.03  | `beacon.rs::FailoverPool::fork_version_for_slot` | Done; cache key is fork epoch boundary |
+| S.04  | `beacon.rs::committee_pubkeys` + `cache.rs`    | Done; sqlite default backend             |
+| S.05  | `lib.rs::filter_participating`                 | Done                                     |
+| S.06  | `signing_root.rs::compute_signing_root`        | Done; parameterised on fork & GVR        |
+| S.07  | `primitive.rs::NativePrimitive`                | Done; wasm adapter filed as follow-up    |
+| S.08  | `lib.rs::sign_response` + `ao.rs::MockAo`      | Stub signature + mock AO; real TEE/AO TODO |
+
+Decisions made in implementation:
+- **DECIDED — host-side signing-root computation** (S.08). Lives in `signing_root.rs`. Wasm primitive stays minimal.
+- **DECIDED — sqlite for the period cache** (S.04). Trait-based; LMDB swap if bench shows contention.
+- **DECIDED — `default_mainnet_pool` is operator-supplied** (S.05). Endpoints aren't baked in; ops vetting happens at config time.
+
+Operator runbook: see [O-702](O-702-bls-device-runbook.md).
 
 ## Subsequent runbook entries
 

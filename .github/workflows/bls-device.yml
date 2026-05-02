@@ -1,0 +1,42 @@
+name: bls-device
+
+on:
+  push:
+    branches: [master, "claude/**"]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build wasm primitive
+        run: cargo build --release --target wasm32-unknown-unknown -p bls-verifier
+
+      - name: Workspace test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Upload wasm artifact for downstream consumers
+        uses: actions/upload-artifact@v4
+        with:
+          name: bls_verifier_wasm
+          path: target/wasm32-unknown-unknown/release/bls_verifier.wasm
+          if-no-files-found: error
+          retention-days: 30

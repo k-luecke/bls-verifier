@@ -1,0 +1,15 @@
+{
+  "name": "~bls-sync-committee",
+  "version": "1.0",
+  "wasm_path": "${WASM_PATH}",
+  "harness_entrypoint": "${HARNESS_BIN}",
+  "deploy_key_id": "${DEPLOY_KEY_ID}",
+  "primitive_return_codes": [
+    { "code": 1,  "label": "Valid" },
+    { "code": 0,  "label": "Invalid" },
+    { "code": -1, "label": "SignatureParseFailure" },
+    { "code": -2, "label": "PubkeyParseFailure" },
+    { "code": -3, "label": "AggregationFailed" },
+    { "code": -4, "label": "InvalidSigningRoot" }
+  ]
+}

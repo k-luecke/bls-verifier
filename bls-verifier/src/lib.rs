@@ -89,8 +89,3 @@ pub extern "C" fn verify_sync_committee(
     }
 }
 
-// sha2 is removed from the cdylib's dependency wall — the primitive does
-// not hash anything; the caller supplies the signing root pre-computed.
-// Keeping it in Cargo.toml for now would be dead weight, but harmless;
-// remove from the manifest in a follow-up commit if we want to slim the
-// cdylib.
