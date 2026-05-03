@@ -46,13 +46,32 @@
 use blst::min_pk::{PublicKey, Signature, AggregatePublicKey};
 use blst::BLST_ERROR;
 
+/// # Safety
+///
+/// The caller is responsible for the standard FFI pointer-validity contract:
+/// - `pubkeys_ptr` must point to at least `pubkeys_len` valid bytes
+/// - `sig_ptr` must point to at least 96 valid bytes
+/// - `signing_root_ptr` must point to exactly 32 valid bytes
+/// - all three pointers must be non-null and properly aligned for `u8`
+/// - the memory must remain valid for the duration of this call
+///
+/// Null pointers and zero-length pubkeys input are detected and return -2
+/// (matching the "no pubkeys provided" error code) rather than segfaulting,
+/// but this defense is best-effort — any other invalid pointer is undefined
+/// behavior.
 #[no_mangle]
-pub extern "C" fn verify_sync_committee(
+pub unsafe extern "C" fn verify_sync_committee(
     pubkeys_ptr: *const u8,
     pubkeys_len: usize,
     sig_ptr: *const u8,
     signing_root_ptr: *const u8,
 ) -> i32 {
+    if sig_ptr.is_null() || signing_root_ptr.is_null() {
+        return -1;
+    }
+    if pubkeys_ptr.is_null() || pubkeys_len == 0 {
+        return -2;
+    }
     let pubkeys_bytes = unsafe { std::slice::from_raw_parts(pubkeys_ptr, pubkeys_len) };
     let sig_bytes = unsafe { std::slice::from_raw_parts(sig_ptr, 96) };
     let signing_root = unsafe { std::slice::from_raw_parts(signing_root_ptr, 32) };

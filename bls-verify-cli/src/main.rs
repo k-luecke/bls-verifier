@@ -3,20 +3,41 @@ use blst::BLST_ERROR;
 use sha2::{Sha256, Digest};
 use std::io::{self, Read};
 
+type CliError = Box<dyn std::error::Error>;
+
 fn main() {
-    // Read JSON from stdin
+    if let Err(e) = run() {
+        eprintln!("bls-verify-cli: {e}");
+        println!("{}", serde_json::json!({"verified": false, "error": e.to_string()}));
+        std::process::exit(1);
+    }
+}
+
+fn require_str<'a>(v: &'a serde_json::Value, key: &'static str) -> Result<&'a str, CliError> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| format!("missing required string field: {key}").into())
+}
+
+fn require_array<'a>(v: &'a serde_json::Value, key: &'static str) -> Result<&'a Vec<serde_json::Value>, CliError> {
+    v.get(key)
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| format!("missing required array field: {key}").into())
+}
+
+fn run() -> Result<(), CliError> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).unwrap();
+    io::stdin().read_to_string(&mut input)?;
 
-    let data: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&input)
+        .map_err(|e| format!("stdin is not valid JSON: {e}"))?;
 
-    let sig_hex = data["signature"].as_str().unwrap().trim_start_matches("0x");
-    let bits_hex = data["bits"].as_str().unwrap().trim_start_matches("0x");
-    let parent_root_hex = data["parent_root"].as_str().unwrap().trim_start_matches("0x");
-    let pubkeys_array = data["pubkeys"].as_array().unwrap();
+    let sig_hex = require_str(&data, "signature")?.trim_start_matches("0x");
+    let bits_hex = require_str(&data, "bits")?.trim_start_matches("0x");
+    let parent_root_hex = require_str(&data, "parent_root")?.trim_start_matches("0x");
+    let pubkeys_array = require_array(&data, "pubkeys")?;
 
-    // Parse participation bits and filter pubkeys
-    let bits_bytes = hex_to_bytes(bits_hex);
+    let bits_bytes = hex_to_bytes(bits_hex)?;
     let mut participating_pubkeys: Vec<PublicKey> = vec![];
 
     for (i, pk_hex) in pubkeys_array.iter().enumerate() {
@@ -25,7 +46,9 @@ fn main() {
         if byte_idx < bits_bytes.len() {
             let participated = (bits_bytes[byte_idx] >> bit_idx) & 1 == 1;
             if participated {
-                let pk_bytes = hex_to_bytes(pk_hex.as_str().unwrap().trim_start_matches("0x"));
+                let pk_str = pk_hex.as_str()
+                    .ok_or_else(|| format!("pubkeys[{i}] is not a string"))?;
+                let pk_bytes = hex_to_bytes(pk_str.trim_start_matches("0x"))?;
                 if let Ok(pk) = PublicKey::from_bytes(&pk_bytes) {
                     participating_pubkeys.push(pk);
                 }
@@ -39,41 +62,25 @@ fn main() {
     // input field so this stays a pure function over byte buffers.
     let genesis_validators_root = hex_to_bytes(
         "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
-    );
-    let fork_version_hex = data["fork_version"]
-        .as_str()
-        .expect("fork_version field is required (4-byte hex, e.g. \"0x06000000\")")
-        .trim_start_matches("0x");
-    let fork_version = hex_to_bytes(fork_version_hex);
+    )?;
+    let fork_version_hex = require_str(&data, "fork_version")?.trim_start_matches("0x");
+    let fork_version = hex_to_bytes(fork_version_hex)?;
     if fork_version.len() != 4 {
-        println!("{}", serde_json::json!({
-            "verified": false,
-            "error": format!("fork_version must be 4 bytes, got {}", fork_version.len())
-        }));
-        return;
+        return Err(format!("fork_version must be 4 bytes, got {}", fork_version.len()).into());
     }
     let domain = compute_domain(&fork_version, &genesis_validators_root);
-    let parent_root_bytes = hex_to_bytes(parent_root_hex);
+    let parent_root_bytes = hex_to_bytes(parent_root_hex)?;
     let signing_root = compute_signing_root(&parent_root_bytes, &domain);
 
     // Aggregate pubkeys and verify
     let pk_refs: Vec<&PublicKey> = participating_pubkeys.iter().collect();
-    let agg_pk = match AggregatePublicKey::aggregate(&pk_refs, true) {
-        Ok(a) => a.to_public_key(),
-        Err(e) => {
-            println!("{}", serde_json::json!({"verified": false, "error": format!("{:?}", e)}));
-            return;
-        }
-    };
+    let agg_pk = AggregatePublicKey::aggregate(&pk_refs, true)
+        .map_err(|e| format!("aggregate: {e:?}"))?
+        .to_public_key();
 
-    let sig_bytes = hex_to_bytes(sig_hex);
-    let sig = match Signature::from_bytes(&sig_bytes) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("{}", serde_json::json!({"verified": false, "error": format!("{:?}", e)}));
-            return;
-        }
-    };
+    let sig_bytes = hex_to_bytes(sig_hex)?;
+    let sig = Signature::from_bytes(&sig_bytes)
+        .map_err(|e| format!("signature parse: {e:?}"))?;
 
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     let result = sig.verify(true, &signing_root, dst, &[], &agg_pk, true);
@@ -85,12 +92,14 @@ fn main() {
                 "participating": pk_refs.len(),
                 "signing_root": bytes_to_hex(&signing_root)
             }));
+            Ok(())
         },
         _ => {
             println!("{}", serde_json::json!({
                 "verified": false,
                 "error": format!("{:?}", result)
             }));
+            Ok(())
         }
     }
 }
@@ -124,11 +133,15 @@ fn sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, CliError> {
     let hex = hex.trim_start_matches("0x");
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", hex.len()).into());
+    }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap())
+        .map(|i| u8::from_str_radix(&hex[i..i+2], 16)
+            .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2).into()))
         .collect()
 }
 
