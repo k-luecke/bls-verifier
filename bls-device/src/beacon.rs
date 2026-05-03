@@ -89,8 +89,14 @@ impl BeaconClient for HttpBeaconClient {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
 
-        let mut pubkeys: Vec<[u8; 48]> = Vec::with_capacity(indices.len());
-        // Mirrors the chunks-of-10 pattern from bls-test/src/main.rs:64
+        // Beacon API `/validators?id=...` re-sorts the response by validator
+        // index ascending — the response order does NOT match the request
+        // order. We MUST reassemble in `indices` order; otherwise the sync
+        // committee bitfield positions get mismapped to the wrong pubkeys
+        // and BLS verification fails downstream. (Issue #4 root cause.)
+        let mut by_index: std::collections::HashMap<String, [u8; 48]> =
+            std::collections::HashMap::with_capacity(indices.len());
+        // Chunked to respect URL-length limits at ~10 ids per query.
         for chunk in indices.chunks(10) {
             let query: String = chunk
                 .iter()
@@ -102,18 +108,34 @@ impl BeaconClient for HttpBeaconClient {
                 .await?;
             if let Some(validators) = resp["data"].as_array() {
                 for v in validators {
+                    let idx = v["index"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            DeviceError::BeaconExhausted("validator missing index".into())
+                        })?
+                        .to_string();
                     if let Some(s) = v["validator"]["pubkey"].as_str() {
                         let bytes = hex::decode(s.trim_start_matches("0x"))
                             .map_err(|e| DeviceError::BeaconExhausted(format!("bad pubkey: {e}")))?;
                         if bytes.len() == 48 {
                             let mut pk = [0u8; 48];
                             pk.copy_from_slice(&bytes);
-                            pubkeys.push(pk);
+                            by_index.insert(idx, pk);
                         }
                     }
                 }
             }
         }
+
+        // Reassemble in sync-committee position order (the order of `indices`).
+        let pubkeys: Vec<[u8; 48]> = indices
+            .iter()
+            .map(|i| {
+                by_index.get(i).copied().ok_or_else(|| {
+                    DeviceError::BeaconExhausted(format!("validator {i} missing from response"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(pubkeys)
     }
 }
