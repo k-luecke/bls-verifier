@@ -31,7 +31,9 @@ pub use crate::ao::{AoLogger, MockAo};
 pub use crate::beacon::{BeaconClient, FailoverPool};
 pub use crate::cache::{CommitteeCache, SqliteCommitteeCache};
 pub use crate::primitive::{NativePrimitive, Primitive};
-pub use crate::x402::{MockX402, X402Verifier};
+pub use crate::x402::X402Verifier;
+#[cfg(feature = "mock-x402")]
+pub use crate::x402::MockX402;
 
 /// Mainnet genesis_validators_root. Constant per network — embedded here as
 /// a per-deployment constant. A different chain id means a different deployment.
@@ -120,6 +122,12 @@ pub struct Device {
 }
 
 impl Device {
+    /// Construct a Device. When the `mock-x402` cargo feature is compiled
+    /// in, `BLS_ALLOW_MOCK=1` must be set in the environment or this
+    /// panics at construction. Mirrors paxiom's `PAXIOM_ALLOW_MOCK=1`
+    /// floor; intent is that misconfigured deployments fail loudly at
+    /// process start, not at request time. In a default release build
+    /// (`mock-x402` off) the check is a no-op.
     pub fn new(
         beacon: Arc<FailoverPool>,
         cache: Arc<dyn CommitteeCache>,
@@ -129,6 +137,19 @@ impl Device {
         genesis_validators_root: [u8; 32],
         platform_key_id: impl Into<String>,
     ) -> Self {
+        #[cfg(feature = "mock-x402")]
+        {
+            if std::env::var("BLS_ALLOW_MOCK").as_deref() != Ok("1") {
+                panic!(
+                    "bls-device built with `mock-x402` feature but \
+                     BLS_ALLOW_MOCK=1 not set; refusing to construct \
+                     Device (issue #10)"
+                );
+            }
+            tracing::warn!(
+                "bls-device running with `mock-x402` feature enabled (issue #10)"
+            );
+        }
         Self {
             beacon,
             cache,
