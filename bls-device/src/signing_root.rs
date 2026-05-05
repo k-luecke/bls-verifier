@@ -26,13 +26,13 @@ pub fn compute_signing_root(object_root: &[u8; 32], domain: &[u8; 32]) -> [u8; 3
     let mut data = [0u8; 64];
     data[..32].copy_from_slice(object_root);
     data[32..].copy_from_slice(domain);
-    sha256(&data).try_into().expect("sha256 output is 32 bytes")
+    sha256(&data)
 }
 
-fn sha256(data: &[u8]) -> Vec<u8> {
+fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
-    h.finalize().to_vec()
+    h.finalize().into()
 }
 
 #[cfg(test)]
