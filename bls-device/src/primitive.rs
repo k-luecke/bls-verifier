@@ -18,6 +18,7 @@ pub trait Primitive: Send + Sync {
     ///  -2 = pubkey parse failure
     ///  -3 = aggregation failure
     ///  -4 = signing root is not 32 bytes
+    ///  -5 = empty participating set (caller bug, not a crypto failure)
     fn verify(
         &self,
         participating: &[&[u8; 48]],
@@ -38,7 +39,10 @@ impl Primitive for NativePrimitive {
         signing_root: &[u8; 32],
     ) -> Result<i32> {
         if participating.is_empty() {
-            return Ok(-3);
+            // Empty participating set is a caller-side bug (e.g. all-zero
+            // bitfield), not a real cryptographic aggregation failure.
+            // Return -5 so operators can distinguish the two paths.
+            return Ok(-5);
         }
         let pks: Vec<PublicKey> = participating
             .iter()
@@ -73,6 +77,7 @@ pub fn return_code_to_error_label(code: i32) -> Option<&'static str> {
         -2 => Some("PubkeyParseFailure"),
         -3 => Some("AggregationFailed"),
         -4 => Some("InvalidSigningRoot"),
+        -5 => Some("NoParticipants"),
         _ => Some("UnknownPrimitiveError"),
     }
 }

@@ -59,12 +59,14 @@ impl SqliteCommitteeCache {
 #[async_trait]
 impl CommitteeCache for SqliteCommitteeCache {
     async fn get(&self, period: u64) -> Result<Option<Vec<[u8; 48]>>> {
+        let period_i64 = i64::try_from(period)
+            .map_err(|_| DeviceError::Cache(format!("period {period} overflows i64")))?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT pubkeys FROM sync_committee WHERE period = ?1")
             .map_err(|e| DeviceError::Cache(e.to_string()))?;
         let row: rusqlite::Result<Vec<u8>> =
-            stmt.query_row(params![period as i64], |r| r.get(0));
+            stmt.query_row(params![period_i64], |r| r.get(0));
         match row {
             Ok(blob) => {
                 if blob.len() % 48 != 0 {
@@ -87,6 +89,8 @@ impl CommitteeCache for SqliteCommitteeCache {
     }
 
     async fn put(&self, period: u64, pubkeys: &[[u8; 48]]) -> Result<()> {
+        let period_i64 = i64::try_from(period)
+            .map_err(|_| DeviceError::Cache(format!("period {period} overflows i64")))?;
         let mut blob = Vec::with_capacity(pubkeys.len() * 48);
         for pk in pubkeys {
             blob.extend_from_slice(pk);
@@ -102,7 +106,7 @@ impl CommitteeCache for SqliteCommitteeCache {
         conn.execute(
             "INSERT OR REPLACE INTO sync_committee (period, pubkeys, fetched_at)
              VALUES (?1, ?2, ?3)",
-            params![period as i64, blob, now],
+            params![period_i64, blob, now],
         )
         .map_err(|e| DeviceError::Cache(e.to_string()))?;
         Ok(())
