@@ -24,15 +24,16 @@ pub struct HttpBeaconClient {
 }
 
 impl HttpBeaconClient {
-    pub fn new(base_url: impl Into<String>, label: impl Into<String>) -> Self {
-        Self {
+    pub fn new(base_url: impl Into<String>, label: impl Into<String>) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| DeviceError::BeaconExhausted(format!("reqwest client init: {e}")))?;
+        Ok(Self {
             base_url: base_url.into(),
             label: label.into(),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
-        }
+            http,
+        })
     }
 
     async fn get_json(&self, path: &str) -> Result<Value> {
@@ -228,13 +229,12 @@ impl FailoverPool {
 
 /// Convenience constructor for the production trio (Lodestar / Nimbus / Prysm).
 /// Endpoints are operator-supplied so the pool can be reconfigured without rebuild.
-pub fn default_mainnet_pool(endpoints: &[(String, String)]) -> FailoverPool {
+pub fn default_mainnet_pool(endpoints: &[(String, String)]) -> Result<FailoverPool> {
     let labels: Vec<String> = endpoints.iter().map(|(label, _)| label.clone()).collect();
-    let clients: Vec<Box<dyn BeaconClient>> = endpoints
-        .iter()
-        .map(|(label, url)| {
-            Box::new(HttpBeaconClient::new(url.clone(), label.clone())) as Box<dyn BeaconClient>
-        })
-        .collect();
-    FailoverPool::new(clients, labels)
+    let mut clients: Vec<Box<dyn BeaconClient>> = Vec::with_capacity(endpoints.len());
+    for (label, url) in endpoints {
+        let c = HttpBeaconClient::new(url.clone(), label.clone())?;
+        clients.push(Box::new(c) as Box<dyn BeaconClient>);
+    }
+    Ok(FailoverPool::new(clients, labels))
 }
