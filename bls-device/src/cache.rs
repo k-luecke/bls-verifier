@@ -91,10 +91,13 @@ impl CommitteeCache for SqliteCommitteeCache {
         for pk in pubkeys {
             blob.extend_from_slice(pk);
         }
+        // SystemTime before UNIX_EPOCH would mean a clock skew so severe
+        // (or a deliberate attack) that recording any timestamp at all is
+        // misleading. Surface the error rather than silently writing 0.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0) as i64;
+            .map_err(|e| DeviceError::Cache(format!("system clock before UNIX_EPOCH: {e}")))?
+            .as_secs() as i64;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO sync_committee (period, pubkeys, fetched_at)

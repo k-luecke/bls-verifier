@@ -24,7 +24,7 @@ async fn live_lodestar_verifies_current_head() {
         "lodestar".to_string(),
         "https://lodestar-mainnet.chainsafe.io".to_string(),
     )];
-    let pool = Arc::new(default_mainnet_pool(&endpoints));
+    let pool = Arc::new(default_mainnet_pool(&endpoints).expect("default_mainnet_pool"));
     let cache = Arc::new(SqliteCommitteeCache::open_in_memory().unwrap());
 
     // Fetch current head to build a request.
