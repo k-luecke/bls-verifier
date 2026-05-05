@@ -43,6 +43,12 @@ pub const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
 /// Number of slots per sync committee period (256 epochs * 32 slots).
 pub const SLOTS_PER_PERIOD: u64 = 8192;
 
+/// Sync-committee size per the consensus spec (`SYNC_COMMITTEE_SIZE`).
+pub const SYNC_COMMITTEE_SIZE: usize = 512;
+
+/// Bytes of `Bitvector[SYNC_COMMITTEE_SIZE]` participation bits (= 64).
+pub const SYNC_COMMITTEE_BITS_BYTES: usize = SYNC_COMMITTEE_SIZE / 8;
+
 /// Public request schema (O-701 / S.02).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VerifyRequest {
@@ -148,6 +154,15 @@ impl Device {
             .map_err(|e| DeviceError::InvalidRequest(format!("slot parse: {e}")))?;
         let parent_root = decode_hex_fixed::<32>(&req.parent_root, "parent_root")?;
         let bits = decode_hex(&req.sync_aggregate.sync_committee_bits)?;
+        // SSZ `Bitvector[SYNC_COMMITTEE_SIZE]` is exactly 64 bytes. Reject
+        // truncated/oversize bitfields up front so a malformed input cannot
+        // silently pick an arbitrary subset of the cached committee.
+        if bits.len() != SYNC_COMMITTEE_BITS_BYTES {
+            return Err(DeviceError::InvalidRequest(format!(
+                "sync_committee_bits: expected {SYNC_COMMITTEE_BITS_BYTES} bytes, got {}",
+                bits.len()
+            )));
+        }
         let signature = decode_hex_fixed::<96>(&req.sync_aggregate.sync_committee_signature, "sig")?;
 
         // Stage 2: x402 verify (stub if mock).
@@ -171,6 +186,16 @@ impl Device {
                 fetched
             }
         };
+        // Refuse a committee of any size other than the spec-mandated 512.
+        // A truncated beacon response would otherwise yield committee_size
+        // < 512 and still verify against a partial-aggregate signature,
+        // which is exactly what an attacker wants.
+        if pubkeys.len() != SYNC_COMMITTEE_SIZE {
+            return Err(DeviceError::InvalidRequest(format!(
+                "committee size: expected {SYNC_COMMITTEE_SIZE} pubkeys, got {}",
+                pubkeys.len()
+            )));
+        }
         let committee_size = pubkeys.len() as u32;
 
         // Stage 5: filter by participation bits.
@@ -225,6 +250,18 @@ impl Device {
     }
 }
 
+/// Pick the subset of `pubkeys` whose corresponding bit in `bits` is set.
+///
+/// SSZ `Bitvector[N]` is encoded little-endian within a byte: bit 0 of
+/// byte 0 is participant 0; bit 7 of byte 0 is participant 7; bit 0 of
+/// byte 1 is participant 8. The shift `bits[byte_idx] >> bit_idx`
+/// reflects that LSB-first convention. Do not flip to MSB-first without
+/// also flipping every Ethereum consensus-client interop fixture.
+///
+/// The caller is responsible for asserting `pubkeys.len() ==
+/// SYNC_COMMITTEE_SIZE` and `bits.len() == SYNC_COMMITTEE_BITS_BYTES`.
+/// `Device::verify` does this; the helper itself stays generic so unit
+/// tests can exercise smaller arrays.
 fn filter_participating<'a>(pubkeys: &'a [[u8; 48]], bits: &[u8]) -> Vec<&'a [u8; 48]> {
     pubkeys
         .iter()
@@ -294,6 +331,24 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], &[1u8; 48]);
         assert_eq!(out[1], &[3u8; 48]);
+    }
+
+    #[test]
+    fn filter_participating_lsb_first_byte_order() {
+        // Eight pubkeys, each labelled by index. Bits 0, 3, 7 of byte 0 set,
+        // and bit 0 of byte 1 set: expect indices 0, 3, 7, 8.
+        let pubkeys: Vec<[u8; 48]> = (0..16u8).map(|i| [i; 48]).collect();
+        let bits = vec![0b1000_1001, 0b0000_0001];
+        let out = filter_participating(&pubkeys, &bits);
+        let got_idx: Vec<u8> = out.into_iter().map(|pk| pk[0]).collect();
+        assert_eq!(got_idx, vec![0, 3, 7, 8]);
+    }
+
+    #[test]
+    fn sync_committee_constants_are_consistent() {
+        assert_eq!(SYNC_COMMITTEE_SIZE, 512);
+        assert_eq!(SYNC_COMMITTEE_BITS_BYTES, 64);
+        assert_eq!(SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_BITS_BYTES * 8);
     }
 
     #[test]
