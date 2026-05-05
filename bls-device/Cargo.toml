@@ -28,3 +28,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Compiles the always-Ok MockX402 verifier for integration tests.
+# A default release build does not include MockX402 — see issue #10.
+# Even with this feature on, Device::new requires BLS_ALLOW_MOCK=1
+# at process start.
+mock-x402 = []

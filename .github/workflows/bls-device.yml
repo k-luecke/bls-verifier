@@ -31,7 +31,10 @@ jobs:
         run: cargo build --release --target wasm32-unknown-unknown -p bls-verifier
 
       - name: Workspace test
-        run: cargo test --workspace --no-fail-fast
+        # bls-device integration tests require the mock-x402 feature (issue #10);
+        # the default build deliberately excludes MockX402 to keep it out of release
+        # binaries.
+        run: cargo test --workspace --no-fail-fast --features bls-device/mock-x402
 
       - name: Upload wasm artifact for downstream consumers
         uses: actions/upload-artifact@v4

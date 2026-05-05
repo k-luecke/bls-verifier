@@ -111,6 +111,7 @@ fn fixture_slot(fixture_dir: &PathBuf) -> u64 {
 
 #[tokio::test]
 async fn pipeline_runs_end_to_end_against_fixture() {
+    std::env::set_var("BLS_ALLOW_MOCK", "1");
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

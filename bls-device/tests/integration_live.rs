@@ -19,6 +19,7 @@ async fn live_lodestar_verifies_current_head() {
         eprintln!("BLS_DEVICE_LIVE not set; skipping live test");
         return;
     }
+    std::env::set_var("BLS_ALLOW_MOCK", "1");
 
     let endpoints = vec![(
         "lodestar".to_string(),
