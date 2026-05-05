@@ -6,7 +6,7 @@
 //! in-process, and the wasm adapter is filed as a follow-up once HyperBEAM's
 //! device hosting interface is locked.
 
-use crate::{DeviceError, Result};
+use crate::Result;
 use blst::min_pk::{AggregatePublicKey, PublicKey, Signature};
 use blst::BLST_ERROR;
 
@@ -76,6 +76,3 @@ pub fn return_code_to_error_label(code: i32) -> Option<&'static str> {
         _ => Some("UnknownPrimitiveError"),
     }
 }
-
-#[allow(dead_code)]
-fn _unused_marker(_: DeviceError) {}
