@@ -97,8 +97,13 @@ impl BeaconClient for HttpBeaconClient {
                 .map(|id| format!("id={id}"))
                 .collect::<Vec<_>>()
                 .join("&");
+            // Resolve validator pubkeys against the request's slot, not
+            // `head`. On a validator-key rotation or exit between the slot
+            // of interest and `head`, querying `head` returns the wrong
+            // pubkey set and the cache pins the wrong-but-self-consistent
+            // committee under the period key.
             let resp = self
-                .get_json(&format!("/eth/v1/beacon/states/head/validators?{query}"))
+                .get_json(&format!("/eth/v1/beacon/states/{slot}/validators?{query}"))
                 .await?;
             if let Some(validators) = resp["data"].as_array() {
                 for v in validators {
