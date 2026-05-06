@@ -1,7 +1,11 @@
 //! Live integration test against real Lodestar mainnet.
 //!
-//! Gated on `BLS_DEVICE_LIVE=1` so CI never hits the network. Operators run
-//! this as the proof of the S.02 gate (see paxiom-static phase-0-status).
+//! Marked `#[ignore]` so CI never hits the network. Operators run this
+//! explicitly via `cargo test -- --ignored` as the proof of the S.02 gate
+//! (see paxiom-static phase-0-status). Audit I-5: previously gated on
+//! `BLS_DEVICE_LIVE=1` with a silent return-Ok on unset; that produced a
+//! green CI signal for a test that never executed. `#[ignore]` makes the
+//! skip honest — the runner reports "1 ignored" rather than "1 passed".
 
 use bls_device::{
     ao::MockAo,
@@ -9,16 +13,13 @@ use bls_device::{
     cache::SqliteCommitteeCache,
     primitive::NativePrimitive,
     x402::MockX402,
-    Device, MAINNET_GENESIS_VALIDATORS_ROOT, SyncAggregate, VerifyRequest,
+    mainnet_genesis_validators_root, Device, SyncAggregate, VerifyRequest,
 };
 use std::sync::Arc;
 
 #[tokio::test]
+#[ignore = "live network test; run explicitly with --ignored"]
 async fn live_lodestar_verifies_current_head() {
-    if std::env::var("BLS_DEVICE_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("BLS_DEVICE_LIVE not set; skipping live test");
-        return;
-    }
     std::env::set_var("BLS_ALLOW_MOCK", "1");
 
     let endpoints = vec![(
@@ -75,7 +76,7 @@ async fn live_lodestar_verifies_current_head() {
         Arc::new(NativePrimitive),
         Arc::new(MockX402),
         Arc::new(MockAo),
-        MAINNET_GENESIS_VALIDATORS_ROOT,
+        mainnet_genesis_validators_root(),
         "live-test-key",
         signing_key,
     );
