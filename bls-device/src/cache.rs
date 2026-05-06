@@ -12,8 +12,21 @@ use tokio::task;
 
 #[async_trait]
 pub trait CommitteeCache: Send + Sync {
-    async fn get(&self, period: u64) -> Result<Option<Vec<[u8; 48]>>>;
-    async fn put(&self, period: u64, pubkeys: &[[u8; 48]]) -> Result<()>;
+    /// Fetch the cached committee for `(period, fork_version)`. Returns
+    /// `None` if no row exists for that exact pair, ensuring a row written
+    /// under one fork is never served under a different fork (audit H-6).
+    async fn get(
+        &self,
+        period: u64,
+        fork_version: [u8; 4],
+    ) -> Result<Option<Vec<[u8; 48]>>>;
+
+    async fn put(
+        &self,
+        period: u64,
+        fork_version: [u8; 4],
+        pubkeys: &[[u8; 48]],
+    ) -> Result<()>;
 }
 
 /// SQLite-backed cache. Default for Phase 0 (debuggability over LMDB perf).
@@ -27,9 +40,11 @@ impl SqliteCommitteeCache {
         let conn = Connection::open(path).map_err(|e| DeviceError::Cache(e.to_string()))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sync_committee (
-                period INTEGER PRIMARY KEY,
+                period INTEGER NOT NULL,
+                fork_version BLOB NOT NULL,
                 pubkeys BLOB NOT NULL,
-                fetched_at INTEGER NOT NULL
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (period, fork_version)
             )",
             [],
         )
@@ -43,9 +58,11 @@ impl SqliteCommitteeCache {
         let conn = Connection::open_in_memory().map_err(|e| DeviceError::Cache(e.to_string()))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sync_committee (
-                period INTEGER PRIMARY KEY,
+                period INTEGER NOT NULL,
+                fork_version BLOB NOT NULL,
                 pubkeys BLOB NOT NULL,
-                fetched_at INTEGER NOT NULL
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (period, fork_version)
             )",
             [],
         )
@@ -58,15 +75,21 @@ impl SqliteCommitteeCache {
 
 #[async_trait]
 impl CommitteeCache for SqliteCommitteeCache {
-    async fn get(&self, period: u64) -> Result<Option<Vec<[u8; 48]>>> {
+    async fn get(
+        &self,
+        period: u64,
+        fork_version: [u8; 4],
+    ) -> Result<Option<Vec<[u8; 48]>>> {
         let period_i64 = i64::try_from(period)
             .map_err(|_| DeviceError::Cache(format!("period {period} overflows i64")))?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT pubkeys FROM sync_committee WHERE period = ?1")
+            .prepare(
+                "SELECT pubkeys FROM sync_committee WHERE period = ?1 AND fork_version = ?2",
+            )
             .map_err(|e| DeviceError::Cache(e.to_string()))?;
         let row: rusqlite::Result<Vec<u8>> =
-            stmt.query_row(params![period_i64], |r| r.get(0));
+            stmt.query_row(params![period_i64, &fork_version[..]], |r| r.get(0));
         match row {
             Ok(blob) => {
                 if blob.len() % 48 != 0 {
@@ -88,7 +111,12 @@ impl CommitteeCache for SqliteCommitteeCache {
         }
     }
 
-    async fn put(&self, period: u64, pubkeys: &[[u8; 48]]) -> Result<()> {
+    async fn put(
+        &self,
+        period: u64,
+        fork_version: [u8; 4],
+        pubkeys: &[[u8; 48]],
+    ) -> Result<()> {
         let period_i64 = i64::try_from(period)
             .map_err(|_| DeviceError::Cache(format!("period {period} overflows i64")))?;
         let mut blob = Vec::with_capacity(pubkeys.len() * 48);
@@ -104,9 +132,9 @@ impl CommitteeCache for SqliteCommitteeCache {
             .as_secs() as i64;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO sync_committee (period, pubkeys, fetched_at)
-             VALUES (?1, ?2, ?3)",
-            params![period_i64, blob, now],
+            "INSERT OR REPLACE INTO sync_committee
+             (period, fork_version, pubkeys, fetched_at) VALUES (?1, ?2, ?3, ?4)",
+            params![period_i64, &fork_version[..], blob, now],
         )
         .map_err(|e| DeviceError::Cache(e.to_string()))?;
         Ok(())
@@ -132,9 +160,29 @@ mod tests {
     async fn put_get_roundtrip() {
         let cache = SqliteCommitteeCache::open_in_memory().unwrap();
         let pubkeys: Vec<[u8; 48]> = (0..3).map(|i| [i as u8; 48]).collect();
-        cache.put(42, &pubkeys).await.unwrap();
-        let got = cache.get(42).await.unwrap().unwrap();
+        let fork_a: [u8; 4] = [0, 0, 0, 1];
+        cache.put(42, fork_a, &pubkeys).await.unwrap();
+        let got = cache.get(42, fork_a).await.unwrap().unwrap();
         assert_eq!(got, pubkeys);
-        assert!(cache.get(43).await.unwrap().is_none());
+        assert!(cache.get(43, fork_a).await.unwrap().is_none());
+    }
+
+    /// Audit H-6 (#15): a row written under one fork version MUST NOT be
+    /// served under a different fork version even if the period matches.
+    #[tokio::test]
+    async fn fork_version_isolates_rows() {
+        let cache = SqliteCommitteeCache::open_in_memory().unwrap();
+        let pubkeys_a: Vec<[u8; 48]> = (0..3).map(|i| [i as u8; 48]).collect();
+        let pubkeys_b: Vec<[u8; 48]> = (10..13).map(|i| [i as u8; 48]).collect();
+        let fork_a: [u8; 4] = [0, 0, 0, 1];
+        let fork_b: [u8; 4] = [0, 0, 0, 2];
+
+        cache.put(42, fork_a, &pubkeys_a).await.unwrap();
+        // Same period, different fork: must miss.
+        assert!(cache.get(42, fork_b).await.unwrap().is_none());
+
+        cache.put(42, fork_b, &pubkeys_b).await.unwrap();
+        assert_eq!(cache.get(42, fork_a).await.unwrap().unwrap(), pubkeys_a);
+        assert_eq!(cache.get(42, fork_b).await.unwrap().unwrap(), pubkeys_b);
     }
 }
