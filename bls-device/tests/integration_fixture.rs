@@ -18,7 +18,7 @@ use bls_device::{
     cache::SqliteCommitteeCache,
     primitive::NativePrimitive,
     x402::MockX402,
-    Device, DeviceError, MAINNET_GENESIS_VALIDATORS_ROOT, SyncAggregate, VerifyRequest,
+    mainnet_genesis_validators_root, Device, DeviceError, SyncAggregate, VerifyRequest,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,7 +136,7 @@ async fn pipeline_runs_end_to_end_against_fixture() {
         Arc::new(NativePrimitive),
         Arc::new(MockX402),
         Arc::new(MockAo),
-        MAINNET_GENESIS_VALIDATORS_ROOT,
+        mainnet_genesis_validators_root(),
         "test-key-1",
         signing_key,
     );

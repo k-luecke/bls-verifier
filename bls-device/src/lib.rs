@@ -35,12 +35,45 @@ pub use crate::x402::X402Verifier;
 #[cfg(feature = "mock-x402")]
 pub use crate::x402::MockX402;
 
-/// Mainnet genesis_validators_root. Constant per network — embedded here as
-/// a per-deployment constant. A different chain id means a different deployment.
-pub const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
+/// Mainnet genesis_validators_root. Constant per network.
+///
+/// Audit M-9 (#24): this used to be a public re-export, which made it
+/// trivially copy-pasteable into `Device::new` calls regardless of which
+/// beacon endpoint the operator actually pointed at. With the constant
+/// public, a misconfigured operator running against a non-mainnet beacon
+/// would silently produce wrong-domain signing roots and every request
+/// would fail the BLS check with no diagnostic pointing at the mismatch.
+///
+/// We considered (and rejected) a `NetworkId` enum threading a curated
+/// set of well-known testnet GVRs through `Device::new`. Reasons:
+///   1. paxiom Phase 0 only targets mainnet beacon; no testnet caller
+///      exists in tree.
+///   2. `compute_domain` already mixes GVR into the SHA256 fork-data
+///      root, so cross-network signature reuse is already prevented at
+///      the crypto layer — the issue is purely operator footgun.
+///   3. Hard-coding testnet GVRs invites the same footgun at a different
+///      layer (operator picks the wrong variant).
+///
+/// Instead the constant is `pub(crate)` and exposed only via
+/// `mainnet_genesis_validators_root()` so the call site reads as an
+/// explicit network choice. Tests in this crate use the constant
+/// directly via the accessor; out-of-tree callers must supply 32 bytes
+/// they actually verified against their beacon.
+pub(crate) const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
     0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f, 0xdd, 0x4e,
     0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f, 0x51, 0x1b, 0xfe, 0x95,
 ];
+
+/// Returns the Ethereum **mainnet** genesis_validators_root.
+///
+/// Out-of-tree callers should prefer supplying GVR explicitly (e.g.
+/// fetched once at startup from the configured beacon's
+/// `/eth/v1/beacon/genesis`) so an operator pointing at a non-mainnet
+/// beacon with this accessor surfaces a verification error at the first
+/// request rather than at a quiet domain mismatch downstream.
+pub fn mainnet_genesis_validators_root() -> [u8; 32] {
+    MAINNET_GENESIS_VALIDATORS_ROOT
+}
 
 /// Number of slots per sync committee period (256 epochs * 32 slots).
 pub const SLOTS_PER_PERIOD: u64 = 8192;

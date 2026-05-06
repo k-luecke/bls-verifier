@@ -9,7 +9,7 @@ use bls_device::{
     cache::SqliteCommitteeCache,
     primitive::NativePrimitive,
     x402::MockX402,
-    Device, MAINNET_GENESIS_VALIDATORS_ROOT, SyncAggregate, VerifyRequest,
+    mainnet_genesis_validators_root, Device, SyncAggregate, VerifyRequest,
 };
 use std::sync::Arc;
 
@@ -75,7 +75,7 @@ async fn live_lodestar_verifies_current_head() {
         Arc::new(NativePrimitive),
         Arc::new(MockX402),
         Arc::new(MockAo),
-        MAINNET_GENESIS_VALIDATORS_ROOT,
+        mainnet_genesis_validators_root(),
         "live-test-key",
         signing_key,
     );
