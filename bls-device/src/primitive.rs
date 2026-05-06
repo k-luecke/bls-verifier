@@ -44,12 +44,12 @@ impl Primitive for NativePrimitive {
             // Return -5 so operators can distinguish the two paths.
             return Ok(-5);
         }
-        let pks: Vec<PublicKey> = participating
-            .iter()
-            .filter_map(|pk| PublicKey::from_bytes(*pk).ok())
-            .collect();
-        if pks.len() != participating.len() {
-            return Ok(-2);
+        let mut pks: Vec<PublicKey> = Vec::with_capacity(participating.len());
+        for pk in participating {
+            match PublicKey::from_bytes(*pk) {
+                Ok(parsed) => pks.push(parsed),
+                Err(_) => return Ok(-2),
+            }
         }
         let pk_refs: Vec<&PublicKey> = pks.iter().collect();
         let agg_pk = match AggregatePublicKey::aggregate(&pk_refs, true) {
@@ -79,5 +79,26 @@ pub fn return_code_to_error_label(code: i32) -> Option<&'static str> {
         -4 => Some("InvalidSigningRoot"),
         -5 => Some("NoParticipants"),
         _ => Some("UnknownPrimitiveError"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit H-3 (#12): a malformed pubkey anywhere in `participating` MUST
+    /// short-circuit to `Ok(-2)` rather than silently dropping the entry.
+    /// Locks the explicit-loop semantics against future refactors.
+    #[test]
+    fn malformed_pubkey_returns_minus_two() {
+        let bad: [u8; 48] = [0xff; 48];
+        let participating: Vec<&[u8; 48]> = vec![&bad];
+        let signature: [u8; 96] = [0u8; 96];
+        let signing_root: [u8; 32] = [0u8; 32];
+
+        let result = NativePrimitive
+            .verify(&participating, &signature, &signing_root)
+            .expect("verify should not return Err");
+        assert_eq!(result, -2, "malformed pubkey must yield -2");
     }
 }
