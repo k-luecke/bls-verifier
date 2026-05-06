@@ -202,14 +202,16 @@ impl Device {
         // Stage 3: fork lookup (cached per fork epoch boundary, not per slot).
         let fork_version = self.beacon.fork_version_for_slot(slot_u64).await?;
 
-        // Stage 4: committee lookup (cached per period; ~27h refresh).
+        // Stage 4: committee lookup. Cached per (period, fork_version) so a
+        // row written under one fork is never served under a different one
+        // (audit H-6, #15).
         let period = slot_u64 / SLOTS_PER_PERIOD;
-        let pubkeys = match self.cache.get(period).await? {
+        let pubkeys = match self.cache.get(period, fork_version).await? {
             Some(p) => p,
             None => {
                 info!(period, "committee cache miss; fetching from beacon");
                 let fetched = self.beacon.committee_pubkeys(slot_u64).await?;
-                self.cache.put(period, &fetched).await?;
+                self.cache.put(period, fork_version, &fetched).await?;
                 fetched
             }
         };
