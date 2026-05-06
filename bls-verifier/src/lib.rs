@@ -39,20 +39,33 @@
 //! |  `-3` | aggregation failed (subgroup check or internal blst error)    |
 //! |  `-4` | malformed pubkey chunk (any 48-byte slice that is not a valid |
 //! |       | G1 point)                                                     |
+//! |  `-6` | one or more input pointers were null                          |
 //!
 //! These codes are the single source of truth — both this doc-comment
 //! and runbook O-700 must update together if codes change.
+//!
+//! # Safety
+//!
+//! This function is `unsafe` because it dereferences raw pointers supplied
+//! by the C caller. The caller must ensure that `pubkeys_ptr` points to at
+//! least `pubkeys_len` bytes, `sig_ptr` to at least 96 bytes, and
+//! `signing_root_ptr` to at least 32 bytes of initialized memory for the
+//! duration of the call. Null pointers are checked and return `-6`; other
+//! invalid pointers (dangling, misaligned, insufficient length) are UB.
 
 use blst::min_pk::{PublicKey, Signature, AggregatePublicKey};
 use blst::BLST_ERROR;
 
 #[no_mangle]
-pub extern "C" fn verify_sync_committee(
+pub unsafe extern "C" fn verify_sync_committee(
     pubkeys_ptr: *const u8,
     pubkeys_len: usize,
     sig_ptr: *const u8,
     signing_root_ptr: *const u8,
 ) -> i32 {
+    if pubkeys_ptr.is_null() || sig_ptr.is_null() || signing_root_ptr.is_null() {
+        return -6;
+    }
     let pubkeys_bytes = unsafe { std::slice::from_raw_parts(pubkeys_ptr, pubkeys_len) };
     let sig_bytes = unsafe { std::slice::from_raw_parts(sig_ptr, 96) };
     let signing_root = unsafe { std::slice::from_raw_parts(signing_root_ptr, 32) };
@@ -89,3 +102,31 @@ pub extern "C" fn verify_sync_committee(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit H-5 (#14): null pointer in any input must return -6, not UB.
+    #[test]
+    fn null_pointers_return_minus_six() {
+        let pks: [u8; 48] = [0; 48];
+        let sig: [u8; 96] = [0; 96];
+        let root: [u8; 32] = [0; 32];
+
+        unsafe {
+            assert_eq!(
+                verify_sync_committee(std::ptr::null(), 48, sig.as_ptr(), root.as_ptr()),
+                -6
+            );
+            assert_eq!(
+                verify_sync_committee(pks.as_ptr(), 48, std::ptr::null(), root.as_ptr()),
+                -6
+            );
+            assert_eq!(
+                verify_sync_committee(pks.as_ptr(), 48, sig.as_ptr(), std::ptr::null()),
+                -6
+            );
+        }
+    }
+}
