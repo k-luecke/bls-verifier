@@ -188,10 +188,27 @@ impl FailoverPool {
         let mut h = self.health.lock().unwrap_or_else(|p| p.into_inner());
         let alpha = 0.3;
         h[idx].success_ewma = alpha * (success as u8 as f64) + (1.0 - alpha) * h[idx].success_ewma;
+        let now = Instant::now();
+        // Audit M-4 (#19): record() used to clobber cooldown_until on every
+        // call. Two interleaved verify()s on the same endpoint — A fails and
+        // sets cooldown_until = now+60s, B's earlier in-flight request then
+        // returns Ok and clears cooldown_until = None — re-elect the bad
+        // endpoint immediately. Merge instead of clobber:
+        //   - failure: extend the cooldown window (max with existing),
+        //   - success: only clear if the existing cooldown has naturally
+        //     expired. Lets EWMA recover before the endpoint is reranked
+        //     into rotation, and prevents a stale-success ack from
+        //     short-circuiting a fresh failure's cooldown.
         if !success {
-            h[idx].cooldown_until = Some(Instant::now() + self.cooldown);
-        } else {
-            h[idx].cooldown_until = None;
+            let new_until = now + self.cooldown;
+            h[idx].cooldown_until = Some(match h[idx].cooldown_until {
+                Some(existing) if existing > new_until => existing,
+                _ => new_until,
+            });
+        } else if let Some(until) = h[idx].cooldown_until {
+            if until <= now {
+                h[idx].cooldown_until = None;
+            }
         }
     }
 
@@ -238,6 +255,132 @@ impl FailoverPool {
             }
         }
         Err(last_err.unwrap_or_else(|| DeviceError::BeaconExhausted("all exhausted".into())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    /// Beacon stub whose call ordering and per-call result are scripted by
+    /// the test. `gate` lets the test hold a call mid-flight so the pool
+    /// can interleave two calls and force the buggy success-path clobber.
+    struct ScriptedBeacon {
+        first_call_done: Arc<Notify>,
+        release_first: Arc<Notify>,
+        // call n returns results[n]; runs out -> panic so the test fails loudly
+        results: Mutex<std::collections::VecDeque<bool>>,
+        gate_first: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl BeaconClient for ScriptedBeacon {
+        async fn fork_version_for_slot(&self, _slot: u64) -> Result<[u8; 4]> {
+            let pop = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("script exhausted");
+            let is_first = {
+                let mut g = self.gate_first.lock().unwrap();
+                let was = *g;
+                *g = false;
+                was
+            };
+            if is_first {
+                // First call: notify test, wait for release. Second call's
+                // failure recording happens between these two Notify points.
+                self.first_call_done.notify_one();
+                self.release_first.notified().await;
+            }
+            if pop {
+                Ok([1, 2, 3, 4])
+            } else {
+                Err(DeviceError::BeaconExhausted("scripted failure".into()))
+            }
+        }
+        async fn committee_pubkeys(&self, _: u64) -> Result<Vec<[u8; 48]>> {
+            unreachable!()
+        }
+    }
+
+    /// Audit M-4 (#19): record() used to unconditionally set cooldown=None
+    /// on success. Two interleaved verify()s — call A starts (will succeed
+    /// later), call B fails and sets cooldown — A's late success then
+    /// clobbered the cooldown back to None and immediately re-elected the
+    /// just-cooled endpoint.
+    ///
+    /// Reproduction: single-endpoint pool, two concurrent fork_version
+    /// calls. Both pass `order()` (still healthy at lookup). Schedule the
+    /// failure to record first, then release the success. After both
+    /// complete, `order()` must still see the endpoint as cooled — i.e. a
+    /// third call must error with BeaconExhausted, not return Ok.
+    #[tokio::test]
+    async fn record_success_does_not_clobber_concurrent_failure_cooldown() {
+        let first_done = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let beacon = Arc::new(ScriptedBeacon {
+            first_call_done: first_done.clone(),
+            release_first: release.clone(),
+            // call 1 (the gated one) -> Ok; call 2 -> Err
+            results: Mutex::new(vec![true, false].into()),
+            gate_first: Mutex::new(true),
+        });
+
+        // Single-endpoint pool: cooldown is the only thing keeping a bad
+        // endpoint out of rotation, so a clobber bug is observable as
+        // "next call still routes to the just-cooled endpoint".
+        let beacon_dyn: Box<dyn BeaconClient> = Box::new(ArcBeacon(beacon.clone()));
+        let pool = Arc::new(FailoverPool::new(vec![beacon_dyn], vec!["ep0".into()]));
+
+        // Spawn the call that will succeed late (it parks on `release`).
+        let p1 = pool.clone();
+        let h1 = tokio::spawn(async move { p1.fork_version_for_slot(1).await });
+
+        // Wait until call A is parked inside the beacon.
+        first_done.notified().await;
+
+        // Issue call B; it grabs the same endpoint, fails, records cooldown.
+        let r2 = pool.fork_version_for_slot(2).await;
+        assert!(r2.is_err(), "call B was scripted to fail");
+
+        // Release call A so it records success. Buggy code clears cooldown.
+        release.notify_one();
+        let r1 = h1.await.unwrap();
+        assert!(r1.is_ok(), "call A was scripted to succeed");
+
+        // Cooldown invariant: after a fresh failure, a same-tick success
+        // from a concurrent in-flight request must not unstick the
+        // endpoint. Issue a third call — under the bug, ep0 is healthy
+        // again and this returns Ok. With the fix, ep0 is still cooled
+        // and we get BeaconExhausted("no endpoints available").
+        let r3 = pool.fork_version_for_slot(3).await;
+        match r3 {
+            Err(DeviceError::BeaconExhausted(m)) => assert!(
+                m.contains("no endpoints"),
+                "expected exhausted-due-to-cooldown, got: {m}"
+            ),
+            other => panic!(
+                "M-4 regression: cooldown was clobbered by concurrent success record; \
+                 expected BeaconExhausted, got {other:?}"
+            ),
+        }
+    }
+
+    // FailoverPool wants Box<dyn BeaconClient>, but the test holds the
+    // beacon as Arc to script it from the outside. Thin newtype to bridge.
+    struct ArcBeacon(Arc<ScriptedBeacon>);
+    #[async_trait]
+    impl BeaconClient for ArcBeacon {
+        async fn fork_version_for_slot(&self, s: u64) -> Result<[u8; 4]> {
+            self.0.fork_version_for_slot(s).await
+        }
+        async fn committee_pubkeys(&self, s: u64) -> Result<Vec<[u8; 48]>> {
+            self.0.committee_pubkeys(s).await
+        }
     }
 }
 
