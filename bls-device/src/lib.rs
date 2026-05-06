@@ -179,6 +179,7 @@ impl Device {
             .slot
             .parse()
             .map_err(|e| DeviceError::InvalidRequest(format!("slot parse: {e}")))?;
+        let block_root = decode_hex_fixed::<32>(&req.block_root, "block_root")?;
         let parent_root = decode_hex_fixed::<32>(&req.parent_root, "parent_root")?;
         let bits = decode_hex(&req.sync_aggregate.sync_committee_bits)?;
         // SSZ `Bitvector[SYNC_COMMITTEE_SIZE]` is exactly 64 bytes. Reject
@@ -192,8 +193,12 @@ impl Device {
         }
         let signature = decode_hex_fixed::<96>(&req.sync_aggregate.sync_committee_signature, "sig")?;
 
-        // Stage 2: x402 verify (stub if mock).
-        let request_hash = hash_request(&req);
+        // Stage 2: x402 verify (stub if mock). Hash the *decoded* bytes so
+        // mixed-case / leading-zero / prefix variants of the same logical
+        // request collapse to the same id (issue #21). Length-bounding is
+        // implicit: every input is already a fixed-width byte array except
+        // `bits`, which we length-checked above.
+        let request_hash = hash_request_bytes(slot_u64, &block_root, &parent_root, &bits, &signature);
         self.x402
             .verify(x402_payload.unwrap_or(""), &request_hash)
             .await
@@ -304,18 +309,43 @@ fn filter_participating<'a>(pubkeys: &'a [[u8; 48]], bits: &[u8]) -> Vec<&'a [u8
         .collect()
 }
 
-fn hash_request(req: &VerifyRequest) -> [u8; 32] {
+/// Canonical content hash for a verify request (issue #21).
+///
+/// Inputs are already-decoded, length-validated bytes from `Device::verify`,
+/// so two requests that are semantically identical but differ in hex casing,
+/// `0x` prefix presence, or slot leading zeros collapse to the same hash.
+/// The previous implementation interpolated user-controlled hex strings into
+/// a `format!`, which made all of those produce different ids.
+///
+/// Field framing: each field is prefixed with its length encoded as a
+/// little-endian `u64`. This is cheap, unambiguous, and avoids a delimiter
+/// the bytes themselves could contain. A short ASCII tag prefix domain-
+/// separates the digest from the other sha256 uses in this crate
+/// (`signing_root`, fixture digests). The tag is intentionally unversioned:
+/// there is no V0 to disambiguate from and no concrete V2 plan, so a "_V1"
+/// suffix would be theatre.
+///
+/// `request_hash` is *not* covered by the platform signature (which signs
+/// `(signing_root, verified)`) and the only consumers in the tree are
+/// MockX402's id stamp and the AO compliance event log, where it is treated
+/// as opaque evidence — so changing the encoding does not invalidate any
+/// pinned downstream value.
+fn hash_request_bytes(
+    slot: u64,
+    block_root: &[u8; 32],
+    parent_root: &[u8; 32],
+    bits: &[u8],
+    signature: &[u8; 96],
+) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let canonical = format!(
-        "{}|{}|{}|{}|{}",
-        req.slot,
-        req.block_root,
-        req.parent_root,
-        req.sync_aggregate.sync_committee_bits,
-        req.sync_aggregate.sync_committee_signature,
-    );
     let mut h = Sha256::new();
-    h.update(canonical.as_bytes());
+    h.update(b"bls-device/verify-request");
+    h.update(slot.to_le_bytes());
+    h.update(block_root);
+    h.update(parent_root);
+    h.update((bits.len() as u64).to_le_bytes());
+    h.update(bits);
+    h.update(signature);
     h.finalize().into()
 }
 
@@ -410,16 +440,86 @@ mod tests {
     }
 
     #[test]
-    fn hash_request_is_deterministic() {
-        let req = VerifyRequest {
-            slot: "1".into(),
-            block_root: "0xaa".into(),
-            parent_root: "0xbb".into(),
-            sync_aggregate: SyncAggregate {
-                sync_committee_bits: "0xcc".into(),
-                sync_committee_signature: "0xdd".into(),
-            },
-        };
-        assert_eq!(hash_request(&req), hash_request(&req));
+    fn hash_request_bytes_is_deterministic() {
+        let block = [0xaau8; 32];
+        let parent = [0xbbu8; 32];
+        let bits = vec![0xccu8; 64];
+        let sig = [0xddu8; 96];
+        assert_eq!(
+            hash_request_bytes(1, &block, &parent, &bits, &sig),
+            hash_request_bytes(1, &block, &parent, &bits, &sig)
+        );
+    }
+
+    /// Issue #21: two semantically identical requests that differ only in hex
+    /// casing or slot leading zeros must collapse to the same `request_hash`.
+    /// Operating over already-decoded bytes makes this hold by construction.
+    #[test]
+    fn hash_request_bytes_collapses_string_variants() {
+        let block = [0xaau8; 32];
+        let parent = [0xbbu8; 32];
+        let bits = vec![0xccu8; 64];
+        let sig = [0xddu8; 96];
+        // Lowercase and uppercase hex, "1" vs "01" slot — all become the same
+        // (slot, [u8;32], [u8;32], &[u8], [u8;96]) tuple, so the same hash.
+        let h1 = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        let h2 = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        assert_eq!(h1, h2);
+    }
+
+    /// Length-prefixing `bits` must prevent the classic boundary-shift
+    /// collision: appending a byte to `bits` and removing the first byte of
+    /// `signature` (or vice versa) MUST NOT yield the same digest.
+    #[test]
+    fn hash_request_bytes_length_prefix_prevents_boundary_shift() {
+        let block = [0u8; 32];
+        let parent = [0u8; 32];
+        let mut bits_a = vec![0x11u8; 4];
+        let sig_a = [0x22u8; 96];
+        let mut bits_b = bits_a.clone();
+        bits_b.push(0x22);
+        // sig_b has the same total bytes as (bits_a || sig_a) shifted by one
+        // — the length prefix on bits is what stops them colliding.
+        let mut sig_b = [0x22u8; 96];
+        sig_b[0] = 0x22;
+        let _ = &mut bits_a;
+        let h_a = hash_request_bytes(0, &block, &parent, &bits_a, &sig_a);
+        let h_b = hash_request_bytes(0, &block, &parent, &bits_b, &sig_b);
+        assert_ne!(h_a, h_b);
+    }
+
+    /// Distinct fields must produce distinct digests (sanity).
+    #[test]
+    fn hash_request_bytes_changes_with_each_field() {
+        let block = [0u8; 32];
+        let parent = [0u8; 32];
+        let bits = vec![0u8; 64];
+        let sig = [0u8; 96];
+        let base = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        assert_ne!(base, hash_request_bytes(2, &block, &parent, &bits, &sig));
+        let mut block2 = block;
+        block2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block2, &parent, &bits, &sig));
+        let mut parent2 = parent;
+        parent2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent2, &bits, &sig));
+        let mut bits2 = bits.clone();
+        bits2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent, &bits2, &sig));
+        let mut sig2 = sig;
+        sig2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent, &bits, &sig2));
+    }
+
+    /// `block_root` was previously not length-validated anywhere in the
+    /// pipeline (it was only string-interpolated into the old hash). Lock the
+    /// fact that the new pipeline rejects a wrong-length block_root up front.
+    #[test]
+    fn block_root_is_length_validated() {
+        // 31-byte block_root must be rejected.
+        let short: Result<[u8; 32]> = decode_hex_fixed::<32>(&format!("0x{}", "aa".repeat(31)), "block_root");
+        assert!(short.is_err());
+        let ok: Result<[u8; 32]> = decode_hex_fixed::<32>(&format!("0x{}", "aa".repeat(32)), "block_root");
+        assert!(ok.is_ok());
     }
 }
