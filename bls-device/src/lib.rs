@@ -107,7 +107,7 @@ pub enum DeviceError {
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
 /// Owns all O-701 device state: beacon pool, committee cache, primitive runner,
-/// x402 verifier, AO logger, and platform signing key id.
+/// x402 verifier, AO logger, and the platform signing key.
 ///
 /// One instance per HyperBEAM device process. Construct at startup; reuse for
 /// the process lifetime.
@@ -119,6 +119,10 @@ pub struct Device {
     pub ao: Arc<dyn AoLogger>,
     pub genesis_validators_root: [u8; 32],
     pub platform_key_id: String,
+    /// ed25519 signing key for the response envelope. Required since audit
+    /// H-2 (#11): the prior SHA-256 stub was forgeable from public response
+    /// data. Real TEE binding is tracked as O-720 follow-up.
+    pub signing_key: ed25519_dalek::SigningKey,
 }
 
 impl Device {
@@ -136,6 +140,7 @@ impl Device {
         ao: Arc<dyn AoLogger>,
         genesis_validators_root: [u8; 32],
         platform_key_id: impl Into<String>,
+        signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
         #[cfg(feature = "mock-x402")]
         {
@@ -158,6 +163,7 @@ impl Device {
             ao,
             genesis_validators_root,
             platform_key_id: platform_key_id.into(),
+            signing_key,
         }
     }
 
@@ -236,7 +242,7 @@ impl Device {
 
         // Stage 8: sign response + AO log.
         let platform_signature =
-            sign_response(&self.platform_key_id, &signing_root, verified);
+            sign_response(&self.signing_key, &signing_root, verified);
         let ao_message_id = self
             .ao
             .log(&ao::ComplianceEvent {
@@ -311,15 +317,20 @@ fn hash_request(req: &VerifyRequest) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Stub platform signature: SHA-256 over (key_id || signing_root || verified-byte).
-/// Real implementation lives in O-720 (TEE-bound key rotation runbook).
-fn sign_response(key_id: &str, signing_root: &[u8; 32], verified: bool) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(key_id.as_bytes());
-    h.update(signing_root);
-    h.update([verified as u8]);
-    h.finalize().into()
+/// Platform signature: ed25519 over (signing_root || verified-byte).
+///
+/// Audit H-2 (#11): the prior SHA-256 stub was forgeable from public
+/// response data. Real TEE binding is tracked as O-720 follow-up.
+fn sign_response(
+    signing_key: &ed25519_dalek::SigningKey,
+    signing_root: &[u8; 32],
+    verified: bool,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let mut msg = [0u8; 33];
+    msg[..32].copy_from_slice(signing_root);
+    msg[32] = verified as u8;
+    signing_key.sign(&msg).to_bytes()
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
