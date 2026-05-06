@@ -85,6 +85,9 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `payment_id` success field. The current canonical x402 verify response
 /// has no such field; the documented success identifier is `payer`. The
 /// trait's `Result<String, String>` therefore returns `payer` on success.
+/// A response with `isValid: true` but a missing or blank `payer` is
+/// rejected as `x402_valid_missing_payer` — we never invent a success
+/// identifier.
 pub struct HttpX402 {
     facilitator_url: String,
     bearer: String,
@@ -174,7 +177,15 @@ impl X402Verifier for HttpX402 {
             .map_err(|e| format!("x402 facilitator response parse: {e}"))?;
 
         if parsed.is_valid {
-            Ok(parsed.payer.unwrap_or_else(|| "unknown".into()))
+            // Reject success-without-payer: returning a placeholder string
+            // here would be inventing a payment identifier, exactly the
+            // discipline issue #45 forbids. Whitespace-only payer is
+            // treated the same as missing.
+            let payer = parsed
+                .payer
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| "x402_valid_missing_payer".to_string())?;
+            Ok(payer)
         } else {
             let reason = parsed
                 .invalid_reason
@@ -214,6 +225,40 @@ mod tests {
         assert_eq!(
             result,
             Ok("0x857b06519E91e3A54538791bDbb0E22373e36b66".to_string())
+        );
+    }
+
+    /// Lock the no-invented-receipt discipline: `isValid: true` without a
+    /// usable `payer` MUST NOT decay into a placeholder Ok value. Both
+    /// missing-field and blank-string variants are rejected with the same
+    /// stable reason token so log scrapers / alerting don't fragment.
+    #[tokio::test]
+    async fn valid_response_without_payer_is_error() {
+        // Case 1: payer field absent.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "isValid": true })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        assert_eq!(
+            client.verify("{}", &[0u8; 32]).await,
+            Err("x402_valid_missing_payer".to_string())
+        );
+
+        // Case 2: payer present but whitespace-only.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "isValid": true,
+                "payer": "   "
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        assert_eq!(
+            client.verify("{}", &[0u8; 32]).await,
+            Err("x402_valid_missing_payer".to_string())
         );
     }
 
