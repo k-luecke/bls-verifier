@@ -129,6 +129,7 @@ async fn pipeline_runs_end_to_end_against_fixture() {
         Box::new(FixtureBeacon::new(fixture_dir.clone(), slot));
     let pool = Arc::new(FailoverPool::new(vec![beacon], vec!["fixture".into()]));
     let cache = Arc::new(SqliteCommitteeCache::open_in_memory().unwrap());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let device = Device::new(
         pool,
         cache.clone(),
@@ -137,6 +138,7 @@ async fn pipeline_runs_end_to_end_against_fixture() {
         Arc::new(MockAo),
         MAINNET_GENESIS_VALIDATORS_ROOT,
         "test-key-1",
+        signing_key,
     );
 
     let req = fixture_request(&fixture_dir, slot);
@@ -146,7 +148,9 @@ async fn pipeline_runs_end_to_end_against_fixture() {
     assert_eq!(resp1.service, "A-202");
     assert_eq!(resp1.slot, slot.to_string());
     assert!(resp1.committee_size > 0);
+    // ed25519 signature is 64 bytes = 128 hex chars after the "0x" prefix.
     assert!(resp1.platform_signature.starts_with("0x"));
+    assert_eq!(resp1.platform_signature.len(), 2 + 128);
     assert!(resp1.ao_message_id.starts_with("mock-ao-"));
 
     // Second call exercises the cache hit path.

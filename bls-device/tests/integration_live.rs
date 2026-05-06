@@ -68,6 +68,7 @@ async fn live_lodestar_verifies_current_head() {
         },
     };
 
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
     let device = Device::new(
         pool,
         cache,
@@ -76,6 +77,7 @@ async fn live_lodestar_verifies_current_head() {
         Arc::new(MockAo),
         MAINNET_GENESIS_VALIDATORS_ROOT,
         "live-test-key",
+        signing_key,
     );
 
     let resp = device.verify(req, None).await.expect("device.verify");
