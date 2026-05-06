@@ -82,7 +82,11 @@ impl CommitteeCache for SqliteCommitteeCache {
     ) -> Result<Option<Vec<[u8; 48]>>> {
         let period_i64 = i64::try_from(period)
             .map_err(|_| DeviceError::Cache(format!("period {period} overflows i64")))?;
-        let conn = self.conn.lock().unwrap();
+        // Audit M-5: a poisoned Mutex (panic in another stage) used to take
+        // down all subsequent verify requests for the process lifetime.
+        // sqlite has its own ACID guarantees; recovering the inner guard
+        // is safe and lets the device keep serving traffic.
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT pubkeys FROM sync_committee WHERE period = ?1 AND fork_version = ?2",
@@ -130,7 +134,8 @@ impl CommitteeCache for SqliteCommitteeCache {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| DeviceError::Cache(format!("system clock before UNIX_EPOCH: {e}")))?
             .as_secs() as i64;
-        let conn = self.conn.lock().unwrap();
+        // M-5: poison-tolerant; see comment in `get`.
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO sync_committee
              (period, fork_version, pubkeys, fetched_at) VALUES (?1, ?2, ?3, ?4)",

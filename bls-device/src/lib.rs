@@ -335,8 +335,22 @@ fn sign_response(
     signing_key.sign(&msg).to_bytes()
 }
 
+/// Decode a `0x`-prefixed hex string into raw bytes. Audit M-7 (#?): the
+/// prefix used to be optional (`trim_start_matches`), which let a JSON
+/// request mix prefixed and unprefixed hex inside the same payload — and
+/// `bits` was passed through here with no length check upstream, so a
+/// 0-byte unprefixed string trivially returned an empty participating set.
+/// `Device::verify` now length-checks `bits` after decoding, but requiring
+/// the prefix here is the cheap second line of defence and matches the
+/// Ethereum-consensus-API convention.
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    Ok(hex::decode(s.trim_start_matches("0x"))?)
+    let body = s.strip_prefix("0x").ok_or_else(|| {
+        DeviceError::InvalidRequest(format!(
+            "hex input must start with 0x prefix (got {} chars)",
+            s.len()
+        ))
+    })?;
+    Ok(hex::decode(body)?)
 }
 
 fn decode_hex_fixed<const N: usize>(s: &str, label: &'static str) -> Result<[u8; N]> {
@@ -383,6 +397,16 @@ mod tests {
         assert_eq!(SYNC_COMMITTEE_SIZE, 512);
         assert_eq!(SYNC_COMMITTEE_BITS_BYTES, 64);
         assert_eq!(SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_BITS_BYTES * 8);
+    }
+
+    /// Audit M-7: decode_hex used to strip an optional `0x` prefix.
+    /// A 0-byte unprefixed string would then trivially decode to an empty
+    /// bytes vector. Lock the strict-prefix invariant.
+    #[test]
+    fn decode_hex_requires_0x_prefix() {
+        assert!(decode_hex("0xdeadbeef").is_ok());
+        assert!(decode_hex("deadbeef").is_err());
+        assert!(decode_hex("").is_err());
     }
 
     #[test]

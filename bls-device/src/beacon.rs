@@ -111,11 +111,21 @@ impl BeaconClient for HttpBeaconClient {
                     if let Some(s) = v["validator"]["pubkey"].as_str() {
                         let bytes = hex::decode(s.trim_start_matches("0x"))
                             .map_err(|e| DeviceError::BeaconExhausted(format!("bad pubkey: {e}")))?;
-                        if bytes.len() == 48 {
-                            let mut pk = [0u8; 48];
-                            pk.copy_from_slice(&bytes);
-                            pubkeys.push(pk);
+                        // Audit M-3 (#?): a buggy beacon returning a wrong-size
+                        // pubkey used to be silently dropped, leaving us with a
+                        // self-consistent but truncated committee that then got
+                        // cached. Error out so the failover pool moves on to a
+                        // healthy endpoint instead of pinning bad data.
+                        if bytes.len() != 48 {
+                            return Err(DeviceError::BeaconExhausted(format!(
+                                "{}: pubkey expected 48 bytes, got {}",
+                                self.label,
+                                bytes.len()
+                            )));
                         }
+                        let mut pk = [0u8; 48];
+                        pk.copy_from_slice(&bytes);
+                        pubkeys.push(pk);
                     }
                 }
             }
@@ -157,7 +167,10 @@ impl FailoverPool {
 
     fn order(&self) -> Vec<usize> {
         let now = Instant::now();
-        let h = self.health.lock().unwrap();
+        // Audit M-5: poison-tolerant. EWMA stats are not safety-critical;
+        // recovering from a panic in another stage lets the failover pool
+        // keep serving rather than wedge for the process lifetime.
+        let h = self.health.lock().unwrap_or_else(|p| p.into_inner());
         let mut indices: Vec<usize> = (0..h.len())
             .filter(|i| h[*i].cooldown_until.map_or(true, |t| t <= now))
             .collect();
@@ -171,7 +184,8 @@ impl FailoverPool {
     }
 
     fn record(&self, idx: usize, success: bool) {
-        let mut h = self.health.lock().unwrap();
+        // M-5: poison-tolerant; see comment in `order`.
+        let mut h = self.health.lock().unwrap_or_else(|p| p.into_inner());
         let alpha = 0.3;
         h[idx].success_ewma = alpha * (success as u8 as f64) + (1.0 - alpha) * h[idx].success_ewma;
         if !success {
@@ -188,7 +202,7 @@ impl FailoverPool {
         }
         let mut last_err = None;
         for idx in order {
-            debug!(endpoint = %self.health.lock().unwrap()[idx].label, "fork lookup");
+            debug!(endpoint = %self.health.lock().unwrap_or_else(|p| p.into_inner())[idx].label, "fork lookup");
             match self.clients[idx].fork_version_for_slot(slot).await {
                 Ok(v) => {
                     self.record(idx, true);
