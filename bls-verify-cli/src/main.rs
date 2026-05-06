@@ -52,7 +52,7 @@ fn run() -> Result<serde_json::Value, String> {
     )?;
     let fork_version_hex = data["fork_version"]
         .as_str()
-        .ok_or("missing 'fork_version' field (4-byte hex, e.g. \"0x06000000\")")?
+        .ok_or("missing 'fork_version' field (4-byte hex string, e.g. \"0xXXXXXXXX\")")?
         .trim_start_matches("0x");
     let fork_version = hex_to_bytes(fork_version_hex)?;
     if fork_version.len() != 4 {

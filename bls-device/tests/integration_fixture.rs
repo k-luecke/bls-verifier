@@ -157,3 +157,65 @@ async fn pipeline_runs_end_to_end_against_fixture() {
     let resp2 = device.verify(req, None).await.unwrap();
     assert_eq!(resp2.committee_size, resp1.committee_size);
 }
+
+/// Audit I-4: the placeholder fixture cannot prove `verified == true`,
+/// but it CAN prove `verified == false` if the signature is tampered. Flip
+/// one byte of `sync_committee_signature` and assert the device reports a
+/// negative verdict (or rejects parsing). This locks the pipeline against
+/// silently accepting any-bytes-go signatures.
+#[tokio::test]
+async fn tampered_signature_does_not_verify() {
+    std::env::set_var("BLS_ALLOW_MOCK", "1");
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("fixtures/beacon");
+    if !fixture_dir.join("MANIFEST.json").exists() {
+        eprintln!(
+            "fixture not present at {}; skipping. Run record-fixture to capture one.",
+            fixture_dir.display()
+        );
+        return;
+    }
+    let slot = fixture_slot(&fixture_dir);
+
+    let beacon: Box<dyn BeaconClient> =
+        Box::new(FixtureBeacon::new(fixture_dir.clone(), slot));
+    let pool = Arc::new(FailoverPool::new(vec![beacon], vec!["fixture".into()]));
+    let cache = Arc::new(SqliteCommitteeCache::open_in_memory().unwrap());
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let device = Device::new(
+        pool,
+        cache.clone(),
+        Arc::new(NativePrimitive),
+        Arc::new(MockX402),
+        Arc::new(MockAo),
+        mainnet_genesis_validators_root(),
+        "test-key-1",
+        signing_key,
+    );
+
+    let mut req = fixture_request(&fixture_dir, slot);
+
+    // Flip one byte (the first signature byte after the "0x" prefix).
+    // We XOR with 0x01 to ensure the value actually changes.
+    let sig = &mut req.sync_aggregate.sync_committee_signature;
+    assert!(sig.starts_with("0x") && sig.len() >= 4, "fixture sig hex");
+    let bytes = hex::decode(sig.trim_start_matches("0x")).expect("fixture sig hex decodes");
+    let mut tampered = bytes.clone();
+    tampered[0] ^= 0x01;
+    let tampered_hex = format!("0x{}", hex::encode(&tampered));
+    assert_ne!(*sig, tampered_hex, "tamper actually changed bytes");
+    *sig = tampered_hex;
+
+    // The device may either accept the request and report verified=false,
+    // or reject parsing entirely. Both are acceptable negative outcomes —
+    // what is forbidden is a verified=true verdict against tampered bytes.
+    match device.verify(req, None).await {
+        Ok(resp) => assert!(
+            !resp.verified,
+            "tampered signature must not yield verified=true; got {resp:?}"
+        ),
+        Err(_) => { /* parse-rejection path is also fine */ }
+    }
+}
