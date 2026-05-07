@@ -88,6 +88,7 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// A response with `isValid: true` but a missing or blank `payer` is
 /// rejected as `x402_valid_missing_payer` — we never invent a success
 /// identifier.
+#[derive(Debug)]
 pub struct HttpX402 {
     facilitator_url: String,
     bearer: String,
