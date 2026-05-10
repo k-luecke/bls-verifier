@@ -12,6 +12,13 @@ path = "src/lib.rs"
 name = "record-fixture"
 path = "src/bin/record_fixture.rs"
 
+# Subprocess form of the device, spawned by paxiom's
+# services/sync-committee/dispatch.mjs when BLS_DEVICE_VIA_SUBPROCESS=1.
+# Operator runbook: docs/O-702-bls-device-harness-runbook.md.
+[[bin]]
+name = "bls-device-harness"
+path = "src/bin/harness.rs"
+
 [dependencies]
 blst = "0.3"
 sha2 = "0.10"
@@ -24,6 +31,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 thiserror = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 rand = "0.8"
