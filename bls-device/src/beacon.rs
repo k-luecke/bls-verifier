@@ -90,9 +90,33 @@ impl BeaconClient for HttpBeaconClient {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
 
-        let mut pubkeys: Vec<[u8; 48]> = Vec::with_capacity(indices.len());
+        // A sync committee lists 512 validator positions IN COMMITTEE ORDER,
+        // and the same validator frequently occupies several positions, so
+        // `indices` contains duplicates. The `/validators?id=...` endpoint
+        // returns matches sorted by validator index and de-duplicated — it
+        // does NOT echo the query order. Pushing pubkeys in response order
+        // (the previous behaviour) scrambled the bit<->pubkey mapping and
+        // collapsed duplicates, so the aggregate of participating keys never
+        // matched the signature and every real verify returned Invalid.
+        //
+        // Fix: query the UNIQUE indices, build an index->pubkey map, then
+        // reconstruct the pubkey vector in committee order, repeating
+        // duplicates. Keyed on each entry's own `index` field rather than
+        // response position, so beacon-side ordering is irrelevant.
+        let mut unique: Vec<&String> = Vec::new();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for idx in &indices {
+                if seen.insert(idx.as_str()) {
+                    unique.push(idx);
+                }
+            }
+        }
+
+        let mut by_index: std::collections::HashMap<String, [u8; 48]> =
+            std::collections::HashMap::with_capacity(unique.len());
         // Mirrors the chunks-of-10 pattern from bls-test/src/main.rs:64
-        for chunk in indices.chunks(10) {
+        for chunk in unique.chunks(10) {
             let query: String = chunk
                 .iter()
                 .map(|id| format!("id={id}"))
@@ -108,6 +132,10 @@ impl BeaconClient for HttpBeaconClient {
                 .await?;
             if let Some(validators) = resp["data"].as_array() {
                 for v in validators {
+                    let idx = match v["index"].as_str() {
+                        Some(i) => i.to_string(),
+                        None => continue,
+                    };
                     if let Some(s) = v["validator"]["pubkey"].as_str() {
                         let bytes = hex::decode(s.trim_start_matches("0x"))
                             .map_err(|e| DeviceError::BeaconExhausted(format!("bad pubkey: {e}")))?;
@@ -125,12 +153,83 @@ impl BeaconClient for HttpBeaconClient {
                         }
                         let mut pk = [0u8; 48];
                         pk.copy_from_slice(&bytes);
-                        pubkeys.push(pk);
+                        by_index.insert(idx, pk);
                     }
                 }
             }
         }
-        Ok(pubkeys)
+
+        // Reconstruct in committee order, repeating duplicates.
+        committee_pubkeys_in_order(&indices, &by_index, &self.label)
+    }
+}
+
+/// Reassemble committee pubkeys in committee order from a de-duplicated
+/// index->pubkey map.
+///
+/// The beacon `/validators?id=...` endpoint returns matches sorted by
+/// validator index and de-duplicated, ignoring the query order, whereas a
+/// sync committee is 512 positions in committee order WITH duplicates (the
+/// same validator commonly fills several positions). This maps each committee
+/// position back to its pubkey — repeating duplicates — so the bit<->pubkey
+/// alignment the BLS aggregate depends on is preserved. Pushing pubkeys in
+/// beacon-response order instead scrambled that mapping and made every real
+/// signature verify as Invalid.
+fn committee_pubkeys_in_order(
+    indices: &[String],
+    by_index: &std::collections::HashMap<String, [u8; 48]>,
+    label: &str,
+) -> Result<Vec<[u8; 48]>> {
+    let mut pubkeys: Vec<[u8; 48]> = Vec::with_capacity(indices.len());
+    for idx in indices {
+        let pk = by_index.get(idx).ok_or_else(|| {
+            DeviceError::BeaconExhausted(format!(
+                "{label}: beacon did not return pubkey for committee validator {idx}"
+            ))
+        })?;
+        pubkeys.push(*pk);
+    }
+    Ok(pubkeys)
+}
+
+#[cfg(test)]
+mod committee_order_tests {
+    use super::committee_pubkeys_in_order;
+    use std::collections::HashMap;
+
+    fn pk(b: u8) -> [u8; 48] {
+        [b; 48]
+    }
+
+    // Regression: committee order + duplicates must be preserved even though
+    // the beacon returns the index->pubkey set sorted and de-duplicated.
+    #[test]
+    fn preserves_committee_order_and_duplicates() {
+        // Committee order with validator 5 and 2 each appearing twice.
+        let indices = vec![
+            "5".to_string(),
+            "2".to_string(),
+            "5".to_string(),
+            "9".to_string(),
+            "2".to_string(),
+        ];
+        // Beacon-style response: sorted by index, de-duplicated.
+        let mut by_index = HashMap::new();
+        by_index.insert("2".to_string(), pk(0xB2));
+        by_index.insert("5".to_string(), pk(0xA5));
+        by_index.insert("9".to_string(), pk(0xC9));
+
+        let out = committee_pubkeys_in_order(&indices, &by_index, "test").unwrap();
+        assert_eq!(out, vec![pk(0xA5), pk(0xB2), pk(0xA5), pk(0xC9), pk(0xB2)]);
+        assert_eq!(out.len(), indices.len(), "must keep all 5 positions, not 3");
+    }
+
+    #[test]
+    fn errors_when_pubkey_missing() {
+        let indices = vec!["7".to_string()];
+        let by_index = HashMap::new();
+        let err = committee_pubkeys_in_order(&indices, &by_index, "test").unwrap_err();
+        assert!(format!("{err:?}").contains('7'));
     }
 }
 
