@@ -33,7 +33,7 @@ fn run() -> Result<serde_json::Value, String> {
             let participated = (bits_bytes[byte_idx] >> bit_idx) & 1 == 1;
             if participated {
                 let pk_str = pk_hex.as_str()
-                    .ok_or("pubkey entry must be a hex string")?
+                    .ok_or_else(|| format!("pubkeys[{i}] is not a string"))?
                     .trim_start_matches("0x");
                 let pk_bytes = hex_to_bytes(pk_str)?;
                 if let Ok(pk) = PublicKey::from_bytes(&pk_bytes) {
@@ -65,12 +65,12 @@ fn run() -> Result<serde_json::Value, String> {
     // Aggregate pubkeys and verify
     let pk_refs: Vec<&PublicKey> = participating_pubkeys.iter().collect();
     let agg_pk = AggregatePublicKey::aggregate(&pk_refs, true)
-        .map_err(|e| format!("{:?}", e))?
+        .map_err(|e| format!("aggregate: {e:?}"))?
         .to_public_key();
 
     let sig_bytes = hex_to_bytes(sig_hex)?;
     let sig = Signature::from_bytes(&sig_bytes)
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| format!("signature parse: {e:?}"))?;
 
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     let result = sig.verify(true, &signing_root, dst, &[], &agg_pk, true);
@@ -91,7 +91,16 @@ fn run() -> Result<serde_json::Value, String> {
 fn main() {
     match run() {
         Ok(out) => println!("{out}"),
-        Err(e) => println!("{}", serde_json::json!({"verified": false, "error": e})),
+        Err(e) => {
+            // Exit non-zero on an input/parse failure. A caller (paxiom's
+            // sdk/verify-and-submit.js) rejects on `code !== 0` and surfaces
+            // stderr; exiting 0 would make "your JSON was malformed"
+            // indistinguishable from "this signature is invalid", since both
+            // print {"verified": false}.
+            eprintln!("bls-verify-cli: {e}");
+            println!("{}", serde_json::json!({"verified": false, "error": e}));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -126,13 +135,13 @@ fn sha256(data: &[u8]) -> Vec<u8> {
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.trim_start_matches("0x");
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(format!("odd-length hex string ({} chars)", hex.len()));
     }
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i+2], 16)
-            .map_err(|e| format!("bad hex: {e}")))
+            .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2)))
         .collect()
 }
 

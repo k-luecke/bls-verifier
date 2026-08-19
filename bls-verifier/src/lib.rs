@@ -56,6 +56,18 @@
 use blst::min_pk::{PublicKey, Signature, AggregatePublicKey};
 use blst::BLST_ERROR;
 
+/// # Safety
+///
+/// The caller is responsible for the standard FFI pointer-validity contract:
+/// - `pubkeys_ptr` must point to at least `pubkeys_len` valid bytes
+/// - `sig_ptr` must point to at least 96 valid bytes
+/// - `signing_root_ptr` must point to exactly 32 valid bytes
+/// - all three pointers must be non-null and properly aligned for `u8`
+/// - the memory must remain valid for the duration of this call
+///
+/// Null pointers are detected and return -6 rather than segfaulting, and a
+/// zero-length pubkeys input returns -2 ("no pubkeys provided"), but this
+/// defense is best-effort — any other invalid pointer is undefined behavior.
 #[no_mangle]
 pub unsafe extern "C" fn verify_sync_committee(
     pubkeys_ptr: *const u8,
