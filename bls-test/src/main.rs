@@ -80,7 +80,13 @@ async fn main() -> Result<(), BoxError> {
 
     // Step 4: fetch all pubkeys in batches of 10
     println!("Fetching pubkeys...");
-    let mut all_pubkeys: Vec<PublicKey> = vec![];
+    // Beacon API `/validators?id=...` re-sorts the response by validator
+    // index ascending — the response order does NOT match the request
+    // order. Build an index→pubkey map, then reassemble in `indices` order.
+    // Without this, sync committee bitfield positions get mismapped to the
+    // wrong pubkeys and BLS verification fails. (Issue #4 root cause.)
+    use std::collections::HashMap;
+    let mut by_index: HashMap<String, PublicKey> = HashMap::with_capacity(indices.len());
 
     for chunk in indices.chunks(10) {
         let query: String = chunk.iter()
@@ -98,16 +104,31 @@ async fn main() -> Result<(), BoxError> {
 
         if let Some(validators) = resp["data"].as_array() {
             for v in validators {
+                let idx = v["index"]
+                    .as_str()
+                    .ok_or("validator index field missing")?
+                    .to_string();
                 let pubkey_hex = v["validator"]["pubkey"]
                     .as_str()
                     .ok_or("validator pubkey field missing")?;
                 let bytes = hex_to_bytes(pubkey_hex)?;
                 if let Ok(pk) = PublicKey::from_bytes(&bytes) {
-                    all_pubkeys.push(pk);
+                    by_index.insert(idx, pk);
                 }
             }
         }
     }
+
+    // Reassemble in sync-committee position order.
+    let all_pubkeys: Vec<PublicKey> = indices
+        .iter()
+        .map(|i| {
+            by_index
+                .get(i)
+                .cloned()
+                .ok_or_else(|| BoxError::from(format!("beacon did not return pubkey for committee validator {i}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     println!("Total pubkeys fetched: {}", all_pubkeys.len());
 
     // Step 5: filter pubkeys by participation bits
