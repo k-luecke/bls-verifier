@@ -31,7 +31,7 @@ pub use crate::ao::{AoLogger, MockAo};
 pub use crate::beacon::{BeaconClient, FailoverPool};
 pub use crate::cache::{CommitteeCache, SqliteCommitteeCache};
 pub use crate::primitive::{NativePrimitive, Primitive};
-pub use crate::x402::X402Verifier;
+pub use crate::x402::{HttpX402, X402Verifier};
 #[cfg(feature = "mock-x402")]
 pub use crate::x402::MockX402;
 
