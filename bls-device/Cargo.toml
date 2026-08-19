@@ -18,13 +18,24 @@ sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 reqwest = { version = "0.11", features = ["json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 async-trait = "0.1"
 thiserror = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
+
+[features]
+default = []
+# Compiles the always-Ok MockX402 verifier for integration tests.
+# A default release build does not include MockX402 — see issue #10.
+# Even with this feature on, Device::new requires BLS_ALLOW_MOCK=1
+# at process start.
+mock-x402 = []

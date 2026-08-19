@@ -3,22 +3,36 @@ use blst::BLST_ERROR;
 use sha2::{Sha256, Digest};
 use reqwest;
 use serde_json::Value;
+use std::error::Error;
 
+type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+// Audit L-6: `main` propagates errors via `?` instead of unwrapping. The
+// alias must match the helper functions' (`Send + Sync`) so `?` can convert
+// between them; std-only, no anyhow.
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), BoxError> {
     let client = reqwest::Client::new();
 
     // Step 1: fetch current head block
     println!("Fetching current head block...");
     let head = client
         .get("https://lodestar-mainnet.chainsafe.io/eth/v1/beacon/headers/head")
-        .send().await.unwrap()
-        .json::<Value>().await.unwrap();
+        .send().await?
+        .json::<Value>().await?;
 
-    let slot = head["data"]["header"]["message"]["slot"].as_str().unwrap().to_string();
-    let block_root = head["data"]["root"].as_str().unwrap().to_string();
+    let slot = head["data"]["header"]["message"]["slot"]
+        .as_str()
+        .ok_or("missing slot")?
+        .to_string();
+    let block_root = head["data"]["root"]
+        .as_str()
+        .ok_or("missing block root")?
+        .to_string();
     let parent_root = head["data"]["header"]["message"]["parent_root"]
-        .as_str().unwrap().to_string();
+        .as_str()
+        .ok_or("missing parent_root")?
+        .to_string();
     println!("Slot: {}", slot);
     println!("Block root: {}", block_root);
     println!("Parent root: {}", parent_root);
@@ -28,16 +42,18 @@ async fn main() {
         "https://lodestar-mainnet.chainsafe.io/eth/v2/beacon/blocks/{}",
         slot
     );
-    let block = client.get(&block_url).send().await.unwrap()
-        .json::<Value>().await.unwrap();
+    let block = client.get(&block_url).send().await?
+        .json::<Value>().await?;
 
     let sig_hex = block["data"]["message"]["body"]["sync_aggregate"]["sync_committee_signature"]
-        .as_str().unwrap()
+        .as_str()
+        .ok_or("missing sync_committee_signature")?
         .trim_start_matches("0x")
         .to_string();
 
     let bits_hex = block["data"]["message"]["body"]["sync_aggregate"]["sync_committee_bits"]
-        .as_str().unwrap()
+        .as_str()
+        .ok_or("missing sync_committee_bits")?
         .trim_start_matches("0x")
         .to_string();
     println!("Got sync aggregate signature and bits");
@@ -47,14 +63,19 @@ async fn main() {
         "https://lodestar-mainnet.chainsafe.io/eth/v1/beacon/states/{}/sync_committees",
         slot
     );
-    let sc = client.get(&sc_url).send().await.unwrap()
-        .json::<Value>().await.unwrap();
+    let sc = client.get(&sc_url).send().await?
+        .json::<Value>().await?;
 
     let indices: Vec<String> = sc["data"]["validators"]
-        .as_array().unwrap()
+        .as_array()
+        .ok_or("missing validators array")?
         .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| BoxError::from("validator index not a string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     println!("Got {} sync committee indices", indices.len());
 
     // Step 4: fetch all pubkeys in batches of 10
@@ -72,13 +93,15 @@ async fn main() {
             query
         );
 
-        let resp = client.get(&url).send().await.unwrap()
-            .json::<Value>().await.unwrap();
+        let resp = client.get(&url).send().await?
+            .json::<Value>().await?;
 
         if let Some(validators) = resp["data"].as_array() {
             for v in validators {
-                let pubkey_hex = v["validator"]["pubkey"].as_str().unwrap_or("");
-                let bytes = hex_to_bytes(pubkey_hex);
+                let pubkey_hex = v["validator"]["pubkey"]
+                    .as_str()
+                    .ok_or("validator pubkey field missing")?;
+                let bytes = hex_to_bytes(pubkey_hex)?;
                 if let Ok(pk) = PublicKey::from_bytes(&bytes) {
                     all_pubkeys.push(pk);
                 }
@@ -88,7 +111,7 @@ async fn main() {
     println!("Total pubkeys fetched: {}", all_pubkeys.len());
 
     // Step 5: filter pubkeys by participation bits
-    let bits_bytes = hex_to_bytes(&bits_hex);
+    let bits_bytes = hex_to_bytes(&bits_hex)?;
     let mut participating_pubkeys: Vec<&PublicKey> = vec![];
 
     for (i, pk) in all_pubkeys.iter().enumerate() {
@@ -106,27 +129,28 @@ async fn main() {
     // Step 6: compute signing root using parent_root
     let genesis_validators_root = hex_to_bytes(
         "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
-    );
+    )?;
 
     // Fetch fork_version dynamically per O-701 / S.06. No hardcoded version.
-    let fork_version = fetch_fork_version(&client, &slot).await;
+    let fork_version = fetch_fork_version(&client, &slot).await?;
     println!("Fork version: 0x{}", bytes_to_hex(&fork_version));
 
     let domain = compute_domain(&fork_version, &genesis_validators_root);
     println!("Domain: {}", bytes_to_hex(&domain));
 
-    let parent_root_bytes = hex_to_bytes(&parent_root);
+    let parent_root_bytes = hex_to_bytes(&parent_root)?;
     let signing_root = compute_signing_root(&parent_root_bytes, &domain);
     println!("Signing root: {}", bytes_to_hex(&signing_root));
 
     // Step 7: aggregate participating pubkeys and verify
     let agg_pk = AggregatePublicKey::aggregate(&participating_pubkeys, true)
-        .expect("aggregation failed");
+        .map_err(|e| format!("aggregation failed: {:?}", e))?;
     let agg_pk = agg_pk.to_public_key();
     println!("Pubkeys aggregated");
 
-    let sig_bytes = hex_to_bytes(&sig_hex);
-    let sig = Signature::from_bytes(&sig_bytes).expect("sig parse failed");
+    let sig_bytes = hex_to_bytes(&sig_hex)?;
+    let sig = Signature::from_bytes(&sig_bytes)
+        .map_err(|e| format!("sig parse failed: {:?}", e))?;
 
     let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     let result = sig.verify(true, &signing_root, dst, &[], &agg_pk, true);
@@ -135,17 +159,18 @@ async fn main() {
         BLST_ERROR::BLST_SUCCESS => println!("\nSIGNATURE VALID - Paxiom verified Ethereum consensus!"),
         _ => println!("\nResult: {:?}", result),
     }
+    Ok(())
 }
 
-async fn fetch_fork_version(client: &reqwest::Client, slot: &str) -> Vec<u8> {
+async fn fetch_fork_version(client: &reqwest::Client, slot: &str) -> Result<Vec<u8>, BoxError> {
     let url = format!(
         "https://lodestar-mainnet.chainsafe.io/eth/v1/beacon/states/{}/fork",
         slot
     );
-    let resp = client.get(&url).send().await.unwrap()
-        .json::<Value>().await.unwrap();
+    let resp = client.get(&url).send().await?
+        .json::<Value>().await?;
     let s = resp["data"]["current_version"].as_str()
-        .expect("beacon /fork response missing current_version");
+        .ok_or("beacon /fork response missing current_version")?;
     hex_to_bytes(s.trim_start_matches("0x"))
 }
 
@@ -182,11 +207,17 @@ fn sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, BoxError> {
     let hex = hex.trim_start_matches("0x");
+    if hex.len() % 2 != 0 {
+        return Err(format!("odd-length hex string ({} chars)", hex.len()).into());
+    }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap())
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| BoxError::from(format!("invalid hex byte at {}: {}", i, e)))
+        })
         .collect()
 }
 

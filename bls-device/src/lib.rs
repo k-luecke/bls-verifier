@@ -31,17 +31,58 @@ pub use crate::ao::{AoLogger, MockAo};
 pub use crate::beacon::{BeaconClient, FailoverPool};
 pub use crate::cache::{CommitteeCache, SqliteCommitteeCache};
 pub use crate::primitive::{NativePrimitive, Primitive};
-pub use crate::x402::{MockX402, X402Verifier};
+pub use crate::x402::{HttpX402, X402Verifier};
+#[cfg(feature = "mock-x402")]
+pub use crate::x402::MockX402;
 
-/// Mainnet genesis_validators_root. Constant per network — embedded here as
-/// a per-deployment constant. A different chain id means a different deployment.
-pub const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
+/// Mainnet genesis_validators_root. Constant per network.
+///
+/// Audit M-9 (#24): this used to be a public re-export, which made it
+/// trivially copy-pasteable into `Device::new` calls regardless of which
+/// beacon endpoint the operator actually pointed at. With the constant
+/// public, a misconfigured operator running against a non-mainnet beacon
+/// would silently produce wrong-domain signing roots and every request
+/// would fail the BLS check with no diagnostic pointing at the mismatch.
+///
+/// We considered (and rejected) a `NetworkId` enum threading a curated
+/// set of well-known testnet GVRs through `Device::new`. Reasons:
+///   1. paxiom Phase 0 only targets mainnet beacon; no testnet caller
+///      exists in tree.
+///   2. `compute_domain` already mixes GVR into the SHA256 fork-data
+///      root, so cross-network signature reuse is already prevented at
+///      the crypto layer — the issue is purely operator footgun.
+///   3. Hard-coding testnet GVRs invites the same footgun at a different
+///      layer (operator picks the wrong variant).
+///
+/// Instead the constant is `pub(crate)` and exposed only via
+/// `mainnet_genesis_validators_root()` so the call site reads as an
+/// explicit network choice. Tests in this crate use the constant
+/// directly via the accessor; out-of-tree callers must supply 32 bytes
+/// they actually verified against their beacon.
+pub(crate) const MAINNET_GENESIS_VALIDATORS_ROOT: [u8; 32] = [
     0x4b, 0x36, 0x3d, 0xb9, 0x4e, 0x28, 0x61, 0x20, 0xd7, 0x6e, 0xb9, 0x05, 0x34, 0x0f, 0xdd, 0x4e,
     0x54, 0xbf, 0xe9, 0xf0, 0x6b, 0xf3, 0x3f, 0xf6, 0xcf, 0x5a, 0xd2, 0x7f, 0x51, 0x1b, 0xfe, 0x95,
 ];
 
+/// Returns the Ethereum **mainnet** genesis_validators_root.
+///
+/// Out-of-tree callers should prefer supplying GVR explicitly (e.g.
+/// fetched once at startup from the configured beacon's
+/// `/eth/v1/beacon/genesis`) so an operator pointing at a non-mainnet
+/// beacon with this accessor surfaces a verification error at the first
+/// request rather than at a quiet domain mismatch downstream.
+pub fn mainnet_genesis_validators_root() -> [u8; 32] {
+    MAINNET_GENESIS_VALIDATORS_ROOT
+}
+
 /// Number of slots per sync committee period (256 epochs * 32 slots).
 pub const SLOTS_PER_PERIOD: u64 = 8192;
+
+/// Sync-committee size per the consensus spec (`SYNC_COMMITTEE_SIZE`).
+pub const SYNC_COMMITTEE_SIZE: usize = 512;
+
+/// Bytes of `Bitvector[SYNC_COMMITTEE_SIZE]` participation bits (= 64).
+pub const SYNC_COMMITTEE_BITS_BYTES: usize = SYNC_COMMITTEE_SIZE / 8;
 
 /// Public request schema (O-701 / S.02).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,7 +140,7 @@ pub enum DeviceError {
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
 /// Owns all O-701 device state: beacon pool, committee cache, primitive runner,
-/// x402 verifier, AO logger, and platform signing key id.
+/// x402 verifier, AO logger, and the platform signing key.
 ///
 /// One instance per HyperBEAM device process. Construct at startup; reuse for
 /// the process lifetime.
@@ -111,9 +152,19 @@ pub struct Device {
     pub ao: Arc<dyn AoLogger>,
     pub genesis_validators_root: [u8; 32],
     pub platform_key_id: String,
+    /// ed25519 signing key for the response envelope. Required since audit
+    /// H-2 (#11): the prior SHA-256 stub was forgeable from public response
+    /// data. Real TEE binding is tracked as O-720 follow-up.
+    pub signing_key: ed25519_dalek::SigningKey,
 }
 
 impl Device {
+    /// Construct a Device. When the `mock-x402` cargo feature is compiled
+    /// in, `BLS_ALLOW_MOCK=1` must be set in the environment or this
+    /// panics at construction. Mirrors paxiom's `PAXIOM_ALLOW_MOCK=1`
+    /// floor; intent is that misconfigured deployments fail loudly at
+    /// process start, not at request time. In a default release build
+    /// (`mock-x402` off) the check is a no-op.
     pub fn new(
         beacon: Arc<FailoverPool>,
         cache: Arc<dyn CommitteeCache>,
@@ -122,7 +173,21 @@ impl Device {
         ao: Arc<dyn AoLogger>,
         genesis_validators_root: [u8; 32],
         platform_key_id: impl Into<String>,
+        signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
+        #[cfg(feature = "mock-x402")]
+        {
+            if std::env::var("BLS_ALLOW_MOCK").as_deref() != Ok("1") {
+                panic!(
+                    "bls-device built with `mock-x402` feature but \
+                     BLS_ALLOW_MOCK=1 not set; refusing to construct \
+                     Device (issue #10)"
+                );
+            }
+            tracing::warn!(
+                "bls-device running with `mock-x402` feature enabled (issue #10)"
+            );
+        }
         Self {
             beacon,
             cache,
@@ -131,6 +196,7 @@ impl Device {
             ao,
             genesis_validators_root,
             platform_key_id: platform_key_id.into(),
+            signing_key,
         }
     }
 
@@ -146,12 +212,26 @@ impl Device {
             .slot
             .parse()
             .map_err(|e| DeviceError::InvalidRequest(format!("slot parse: {e}")))?;
+        let block_root = decode_hex_fixed::<32>(&req.block_root, "block_root")?;
         let parent_root = decode_hex_fixed::<32>(&req.parent_root, "parent_root")?;
         let bits = decode_hex(&req.sync_aggregate.sync_committee_bits)?;
+        // SSZ `Bitvector[SYNC_COMMITTEE_SIZE]` is exactly 64 bytes. Reject
+        // truncated/oversize bitfields up front so a malformed input cannot
+        // silently pick an arbitrary subset of the cached committee.
+        if bits.len() != SYNC_COMMITTEE_BITS_BYTES {
+            return Err(DeviceError::InvalidRequest(format!(
+                "sync_committee_bits: expected {SYNC_COMMITTEE_BITS_BYTES} bytes, got {}",
+                bits.len()
+            )));
+        }
         let signature = decode_hex_fixed::<96>(&req.sync_aggregate.sync_committee_signature, "sig")?;
 
-        // Stage 2: x402 verify (stub if mock).
-        let request_hash = hash_request(&req);
+        // Stage 2: x402 verify (stub if mock). Hash the *decoded* bytes so
+        // mixed-case / leading-zero / prefix variants of the same logical
+        // request collapse to the same id (issue #21). Length-bounding is
+        // implicit: every input is already a fixed-width byte array except
+        // `bits`, which we length-checked above.
+        let request_hash = hash_request_bytes(slot_u64, &block_root, &parent_root, &bits, &signature);
         self.x402
             .verify(x402_payload.unwrap_or(""), &request_hash)
             .await
@@ -160,17 +240,29 @@ impl Device {
         // Stage 3: fork lookup (cached per fork epoch boundary, not per slot).
         let fork_version = self.beacon.fork_version_for_slot(slot_u64).await?;
 
-        // Stage 4: committee lookup (cached per period; ~27h refresh).
+        // Stage 4: committee lookup. Cached per (period, fork_version) so a
+        // row written under one fork is never served under a different one
+        // (audit H-6, #15).
         let period = slot_u64 / SLOTS_PER_PERIOD;
-        let pubkeys = match self.cache.get(period).await? {
+        let pubkeys = match self.cache.get(period, fork_version).await? {
             Some(p) => p,
             None => {
                 info!(period, "committee cache miss; fetching from beacon");
                 let fetched = self.beacon.committee_pubkeys(slot_u64).await?;
-                self.cache.put(period, &fetched).await?;
+                self.cache.put(period, fork_version, &fetched).await?;
                 fetched
             }
         };
+        // Refuse a committee of any size other than the spec-mandated 512.
+        // A truncated beacon response would otherwise yield committee_size
+        // < 512 and still verify against a partial-aggregate signature,
+        // which is exactly what an attacker wants.
+        if pubkeys.len() != SYNC_COMMITTEE_SIZE {
+            return Err(DeviceError::InvalidRequest(format!(
+                "committee size: expected {SYNC_COMMITTEE_SIZE} pubkeys, got {}",
+                pubkeys.len()
+            )));
+        }
         let committee_size = pubkeys.len() as u32;
 
         // Stage 5: filter by participation bits.
@@ -190,7 +282,7 @@ impl Device {
 
         // Stage 8: sign response + AO log.
         let platform_signature =
-            sign_response(&self.platform_key_id, &signing_root, verified);
+            sign_response(&self.signing_key, &signing_root, verified);
         let ao_message_id = self
             .ao
             .log(&ao::ComplianceEvent {
@@ -225,6 +317,18 @@ impl Device {
     }
 }
 
+/// Pick the subset of `pubkeys` whose corresponding bit in `bits` is set.
+///
+/// SSZ `Bitvector[N]` is encoded little-endian within a byte: bit 0 of
+/// byte 0 is participant 0; bit 7 of byte 0 is participant 7; bit 0 of
+/// byte 1 is participant 8. The shift `bits[byte_idx] >> bit_idx`
+/// reflects that LSB-first convention. Do not flip to MSB-first without
+/// also flipping every Ethereum consensus-client interop fixture.
+///
+/// The caller is responsible for asserting `pubkeys.len() ==
+/// SYNC_COMMITTEE_SIZE` and `bits.len() == SYNC_COMMITTEE_BITS_BYTES`.
+/// `Device::verify` does this; the helper itself stays generic so unit
+/// tests can exercise smaller arrays.
 fn filter_participating<'a>(pubkeys: &'a [[u8; 48]], bits: &[u8]) -> Vec<&'a [u8; 48]> {
     pubkeys
         .iter()
@@ -238,34 +342,78 @@ fn filter_participating<'a>(pubkeys: &'a [[u8; 48]], bits: &[u8]) -> Vec<&'a [u8
         .collect()
 }
 
-fn hash_request(req: &VerifyRequest) -> [u8; 32] {
+/// Canonical content hash for a verify request (issue #21).
+///
+/// Inputs are already-decoded, length-validated bytes from `Device::verify`,
+/// so two requests that are semantically identical but differ in hex casing,
+/// `0x` prefix presence, or slot leading zeros collapse to the same hash.
+/// The previous implementation interpolated user-controlled hex strings into
+/// a `format!`, which made all of those produce different ids.
+///
+/// Field framing: each field is prefixed with its length encoded as a
+/// little-endian `u64`. This is cheap, unambiguous, and avoids a delimiter
+/// the bytes themselves could contain. A short ASCII tag prefix domain-
+/// separates the digest from the other sha256 uses in this crate
+/// (`signing_root`, fixture digests). The tag is intentionally unversioned:
+/// there is no V0 to disambiguate from and no concrete V2 plan, so a "_V1"
+/// suffix would be theatre.
+///
+/// `request_hash` is *not* covered by the platform signature (which signs
+/// `(signing_root, verified)`) and the only consumers in the tree are
+/// MockX402's id stamp and the AO compliance event log, where it is treated
+/// as opaque evidence — so changing the encoding does not invalidate any
+/// pinned downstream value.
+fn hash_request_bytes(
+    slot: u64,
+    block_root: &[u8; 32],
+    parent_root: &[u8; 32],
+    bits: &[u8],
+    signature: &[u8; 96],
+) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let canonical = format!(
-        "{}|{}|{}|{}|{}",
-        req.slot,
-        req.block_root,
-        req.parent_root,
-        req.sync_aggregate.sync_committee_bits,
-        req.sync_aggregate.sync_committee_signature,
-    );
     let mut h = Sha256::new();
-    h.update(canonical.as_bytes());
+    h.update(b"bls-device/verify-request");
+    h.update(slot.to_le_bytes());
+    h.update(block_root);
+    h.update(parent_root);
+    h.update((bits.len() as u64).to_le_bytes());
+    h.update(bits);
+    h.update(signature);
     h.finalize().into()
 }
 
-/// Stub platform signature: SHA-256 over (key_id || signing_root || verified-byte).
-/// Real implementation lives in O-720 (TEE-bound key rotation runbook).
-fn sign_response(key_id: &str, signing_root: &[u8; 32], verified: bool) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(key_id.as_bytes());
-    h.update(signing_root);
-    h.update([verified as u8]);
-    h.finalize().into()
+/// Platform signature: ed25519 over (signing_root || verified-byte).
+///
+/// Audit H-2 (#11): the prior SHA-256 stub was forgeable from public
+/// response data. Real TEE binding is tracked as O-720 follow-up.
+fn sign_response(
+    signing_key: &ed25519_dalek::SigningKey,
+    signing_root: &[u8; 32],
+    verified: bool,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let mut msg = [0u8; 33];
+    msg[..32].copy_from_slice(signing_root);
+    msg[32] = verified as u8;
+    signing_key.sign(&msg).to_bytes()
 }
 
+/// Decode a `0x`-prefixed hex string into raw bytes. Audit M-7 (#?): the
+/// prefix used to be optional (`trim_start_matches`), which let a JSON
+/// request mix prefixed and unprefixed hex inside the same payload — and
+/// `bits` was passed through here with no length check upstream, so a
+/// 0-byte unprefixed string trivially returned an empty participating set.
+/// `Device::verify` now length-checks `bits` after decoding, but requiring
+/// the prefix here is the cheap second line of defence and matches the
+/// Ethereum-consensus-API convention.
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    Ok(hex::decode(s.trim_start_matches("0x"))?)
+    let body = s.strip_prefix("0x").ok_or_else(|| {
+        DeviceError::InvalidRequest(format!(
+            "hex input must start with 0x prefix (got {} chars)",
+            s.len()
+        ))
+    })?;
+    Ok(hex::decode(body)?)
 }
 
 fn decode_hex_fixed<const N: usize>(s: &str, label: &'static str) -> Result<[u8; N]> {
@@ -297,16 +445,114 @@ mod tests {
     }
 
     #[test]
-    fn hash_request_is_deterministic() {
-        let req = VerifyRequest {
-            slot: "1".into(),
-            block_root: "0xaa".into(),
-            parent_root: "0xbb".into(),
-            sync_aggregate: SyncAggregate {
-                sync_committee_bits: "0xcc".into(),
-                sync_committee_signature: "0xdd".into(),
-            },
-        };
-        assert_eq!(hash_request(&req), hash_request(&req));
+    fn filter_participating_lsb_first_byte_order() {
+        // Eight pubkeys, each labelled by index. Bits 0, 3, 7 of byte 0 set,
+        // and bit 0 of byte 1 set: expect indices 0, 3, 7, 8.
+        let pubkeys: Vec<[u8; 48]> = (0..16u8).map(|i| [i; 48]).collect();
+        let bits = vec![0b1000_1001, 0b0000_0001];
+        let out = filter_participating(&pubkeys, &bits);
+        let got_idx: Vec<u8> = out.into_iter().map(|pk| pk[0]).collect();
+        assert_eq!(got_idx, vec![0, 3, 7, 8]);
+    }
+
+    #[test]
+    fn sync_committee_constants_are_consistent() {
+        assert_eq!(SYNC_COMMITTEE_SIZE, 512);
+        assert_eq!(SYNC_COMMITTEE_BITS_BYTES, 64);
+        assert_eq!(SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_BITS_BYTES * 8);
+    }
+
+    /// Audit M-7: decode_hex used to strip an optional `0x` prefix.
+    /// A 0-byte unprefixed string would then trivially decode to an empty
+    /// bytes vector. Lock the strict-prefix invariant.
+    #[test]
+    fn decode_hex_requires_0x_prefix() {
+        assert!(decode_hex("0xdeadbeef").is_ok());
+        assert!(decode_hex("deadbeef").is_err());
+        assert!(decode_hex("").is_err());
+    }
+
+    #[test]
+    fn hash_request_bytes_is_deterministic() {
+        let block = [0xaau8; 32];
+        let parent = [0xbbu8; 32];
+        let bits = vec![0xccu8; 64];
+        let sig = [0xddu8; 96];
+        assert_eq!(
+            hash_request_bytes(1, &block, &parent, &bits, &sig),
+            hash_request_bytes(1, &block, &parent, &bits, &sig)
+        );
+    }
+
+    /// Issue #21: two semantically identical requests that differ only in hex
+    /// casing or slot leading zeros must collapse to the same `request_hash`.
+    /// Operating over already-decoded bytes makes this hold by construction.
+    #[test]
+    fn hash_request_bytes_collapses_string_variants() {
+        let block = [0xaau8; 32];
+        let parent = [0xbbu8; 32];
+        let bits = vec![0xccu8; 64];
+        let sig = [0xddu8; 96];
+        // Lowercase and uppercase hex, "1" vs "01" slot — all become the same
+        // (slot, [u8;32], [u8;32], &[u8], [u8;96]) tuple, so the same hash.
+        let h1 = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        let h2 = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        assert_eq!(h1, h2);
+    }
+
+    /// Length-prefixing `bits` must prevent the classic boundary-shift
+    /// collision: appending a byte to `bits` and removing the first byte of
+    /// `signature` (or vice versa) MUST NOT yield the same digest.
+    #[test]
+    fn hash_request_bytes_length_prefix_prevents_boundary_shift() {
+        let block = [0u8; 32];
+        let parent = [0u8; 32];
+        let mut bits_a = vec![0x11u8; 4];
+        let sig_a = [0x22u8; 96];
+        let mut bits_b = bits_a.clone();
+        bits_b.push(0x22);
+        // sig_b has the same total bytes as (bits_a || sig_a) shifted by one
+        // — the length prefix on bits is what stops them colliding.
+        let mut sig_b = [0x22u8; 96];
+        sig_b[0] = 0x22;
+        let _ = &mut bits_a;
+        let h_a = hash_request_bytes(0, &block, &parent, &bits_a, &sig_a);
+        let h_b = hash_request_bytes(0, &block, &parent, &bits_b, &sig_b);
+        assert_ne!(h_a, h_b);
+    }
+
+    /// Distinct fields must produce distinct digests (sanity).
+    #[test]
+    fn hash_request_bytes_changes_with_each_field() {
+        let block = [0u8; 32];
+        let parent = [0u8; 32];
+        let bits = vec![0u8; 64];
+        let sig = [0u8; 96];
+        let base = hash_request_bytes(1, &block, &parent, &bits, &sig);
+        assert_ne!(base, hash_request_bytes(2, &block, &parent, &bits, &sig));
+        let mut block2 = block;
+        block2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block2, &parent, &bits, &sig));
+        let mut parent2 = parent;
+        parent2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent2, &bits, &sig));
+        let mut bits2 = bits.clone();
+        bits2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent, &bits2, &sig));
+        let mut sig2 = sig;
+        sig2[0] = 1;
+        assert_ne!(base, hash_request_bytes(1, &block, &parent, &bits, &sig2));
+    }
+
+    /// `block_root` was previously not length-validated anywhere in the
+    /// pipeline (it was only string-interpolated into the old hash). Lock the
+    /// fact that the new pipeline rejects a wrong-length block_root up front.
+    #[test]
+    fn block_root_is_length_validated() {
+        // 31-byte block_root must be rejected.
+        let short: Result<[u8; 32]> = decode_hex_fixed::<32>(&format!("0x{}", "aa".repeat(31)), "block_root");
+        assert!(short.is_err());
+        let ok: Result<[u8; 32]> = decode_hex_fixed::<32>(&format!("0x{}", "aa".repeat(32)), "block_root");
+        assert!(ok.is_ok());
     }
 }

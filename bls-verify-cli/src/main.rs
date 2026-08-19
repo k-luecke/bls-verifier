@@ -3,40 +3,26 @@ use blst::BLST_ERROR;
 use sha2::{Sha256, Digest};
 use std::io::{self, Read};
 
-type CliError = Box<dyn std::error::Error>;
-
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("bls-verify-cli: {e}");
-        println!("{}", serde_json::json!({"verified": false, "error": e.to_string()}));
-        std::process::exit(1);
-    }
-}
-
-fn require_str<'a>(v: &'a serde_json::Value, key: &'static str) -> Result<&'a str, CliError> {
-    v.get(key)
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| format!("missing required string field: {key}").into())
-}
-
-fn require_array<'a>(v: &'a serde_json::Value, key: &'static str) -> Result<&'a Vec<serde_json::Value>, CliError> {
-    v.get(key)
-        .and_then(|x| x.as_array())
-        .ok_or_else(|| format!("missing required array field: {key}").into())
-}
-
-fn run() -> Result<(), CliError> {
+fn run() -> Result<serde_json::Value, String> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
+    io::stdin().read_to_string(&mut input).map_err(|e| format!("stdin read: {e}"))?;
 
     let data: serde_json::Value = serde_json::from_str(&input)
-        .map_err(|e| format!("stdin is not valid JSON: {e}"))?;
+        .map_err(|e| format!("invalid JSON: {e}"))?;
 
-    let sig_hex = require_str(&data, "signature")?.trim_start_matches("0x");
-    let bits_hex = require_str(&data, "bits")?.trim_start_matches("0x");
-    let parent_root_hex = require_str(&data, "parent_root")?.trim_start_matches("0x");
-    let pubkeys_array = require_array(&data, "pubkeys")?;
+    let sig_hex = data["signature"].as_str()
+        .ok_or("missing 'signature' field")?
+        .trim_start_matches("0x");
+    let bits_hex = data["bits"].as_str()
+        .ok_or("missing 'bits' field")?
+        .trim_start_matches("0x");
+    let parent_root_hex = data["parent_root"].as_str()
+        .ok_or("missing 'parent_root' field")?
+        .trim_start_matches("0x");
+    let pubkeys_array = data["pubkeys"].as_array()
+        .ok_or("missing 'pubkeys' field")?;
 
+    // Parse participation bits and filter pubkeys
     let bits_bytes = hex_to_bytes(bits_hex)?;
     let mut participating_pubkeys: Vec<PublicKey> = vec![];
 
@@ -47,8 +33,9 @@ fn run() -> Result<(), CliError> {
             let participated = (bits_bytes[byte_idx] >> bit_idx) & 1 == 1;
             if participated {
                 let pk_str = pk_hex.as_str()
-                    .ok_or_else(|| format!("pubkeys[{i}] is not a string"))?;
-                let pk_bytes = hex_to_bytes(pk_str.trim_start_matches("0x"))?;
+                    .ok_or_else(|| format!("pubkeys[{i}] is not a string"))?
+                    .trim_start_matches("0x");
+                let pk_bytes = hex_to_bytes(pk_str)?;
                 if let Ok(pk) = PublicKey::from_bytes(&pk_bytes) {
                     participating_pubkeys.push(pk);
                 }
@@ -63,10 +50,13 @@ fn run() -> Result<(), CliError> {
     let genesis_validators_root = hex_to_bytes(
         "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
     )?;
-    let fork_version_hex = require_str(&data, "fork_version")?.trim_start_matches("0x");
+    let fork_version_hex = data["fork_version"]
+        .as_str()
+        .ok_or("missing 'fork_version' field (4-byte hex string, e.g. \"0xXXXXXXXX\")")?
+        .trim_start_matches("0x");
     let fork_version = hex_to_bytes(fork_version_hex)?;
     if fork_version.len() != 4 {
-        return Err(format!("fork_version must be 4 bytes, got {}", fork_version.len()).into());
+        return Err(format!("fork_version must be 4 bytes, got {}", fork_version.len()));
     }
     let domain = compute_domain(&fork_version, &genesis_validators_root);
     let parent_root_bytes = hex_to_bytes(parent_root_hex)?;
@@ -86,20 +76,30 @@ fn run() -> Result<(), CliError> {
     let result = sig.verify(true, &signing_root, dst, &[], &agg_pk, true);
 
     match result {
-        BLST_ERROR::BLST_SUCCESS => {
-            println!("{}", serde_json::json!({
-                "verified": true,
-                "participating": pk_refs.len(),
-                "signing_root": bytes_to_hex(&signing_root)
-            }));
-            Ok(())
-        },
-        _ => {
-            println!("{}", serde_json::json!({
-                "verified": false,
-                "error": format!("{:?}", result)
-            }));
-            Ok(())
+        BLST_ERROR::BLST_SUCCESS => Ok(serde_json::json!({
+            "verified": true,
+            "participating": pk_refs.len(),
+            "signing_root": bytes_to_hex(&signing_root)
+        })),
+        _ => Ok(serde_json::json!({
+            "verified": false,
+            "error": format!("{:?}", result)
+        })),
+    }
+}
+
+fn main() {
+    match run() {
+        Ok(out) => println!("{out}"),
+        Err(e) => {
+            // Exit non-zero on an input/parse failure. A caller (paxiom's
+            // sdk/verify-and-submit.js) rejects on `code !== 0` and surfaces
+            // stderr; exiting 0 would make "your JSON was malformed"
+            // indistinguishable from "this signature is invalid", since both
+            // print {"verified": false}.
+            eprintln!("bls-verify-cli: {e}");
+            println!("{}", serde_json::json!({"verified": false, "error": e}));
+            std::process::exit(1);
         }
     }
 }
@@ -133,15 +133,15 @@ fn sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, CliError> {
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.trim_start_matches("0x");
     if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()).into());
+        return Err(format!("odd-length hex string ({} chars)", hex.len()));
     }
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i+2], 16)
-            .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2).into()))
+            .map_err(|e| format!("invalid hex at byte {}: {e}", i / 2)))
         .collect()
 }
 

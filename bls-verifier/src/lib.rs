@@ -39,9 +39,19 @@
 //! |  `-3` | aggregation failed (subgroup check or internal blst error)    |
 //! |  `-4` | malformed pubkey chunk (any 48-byte slice that is not a valid |
 //! |       | G1 point)                                                     |
+//! |  `-6` | one or more input pointers were null                          |
 //!
 //! These codes are the single source of truth — both this doc-comment
 //! and runbook O-700 must update together if codes change.
+//!
+//! # Safety
+//!
+//! This function is `unsafe` because it dereferences raw pointers supplied
+//! by the C caller. The caller must ensure that `pubkeys_ptr` points to at
+//! least `pubkeys_len` bytes, `sig_ptr` to at least 96 bytes, and
+//! `signing_root_ptr` to at least 32 bytes of initialized memory for the
+//! duration of the call. Null pointers are checked and return `-6`; other
+//! invalid pointers (dangling, misaligned, insufficient length) are UB.
 
 use blst::min_pk::{PublicKey, Signature, AggregatePublicKey};
 use blst::BLST_ERROR;
@@ -55,10 +65,9 @@ use blst::BLST_ERROR;
 /// - all three pointers must be non-null and properly aligned for `u8`
 /// - the memory must remain valid for the duration of this call
 ///
-/// Null pointers and zero-length pubkeys input are detected and return -2
-/// (matching the "no pubkeys provided" error code) rather than segfaulting,
-/// but this defense is best-effort — any other invalid pointer is undefined
-/// behavior.
+/// Null pointers are detected and return -6 rather than segfaulting, and a
+/// zero-length pubkeys input returns -2 ("no pubkeys provided"), but this
+/// defense is best-effort — any other invalid pointer is undefined behavior.
 #[no_mangle]
 pub unsafe extern "C" fn verify_sync_committee(
     pubkeys_ptr: *const u8,
@@ -66,11 +75,8 @@ pub unsafe extern "C" fn verify_sync_committee(
     sig_ptr: *const u8,
     signing_root_ptr: *const u8,
 ) -> i32 {
-    if sig_ptr.is_null() || signing_root_ptr.is_null() {
-        return -1;
-    }
-    if pubkeys_ptr.is_null() || pubkeys_len == 0 {
-        return -2;
+    if pubkeys_ptr.is_null() || sig_ptr.is_null() || signing_root_ptr.is_null() {
+        return -6;
     }
     let pubkeys_bytes = unsafe { std::slice::from_raw_parts(pubkeys_ptr, pubkeys_len) };
     let sig_bytes = unsafe { std::slice::from_raw_parts(sig_ptr, 96) };
@@ -108,3 +114,31 @@ pub unsafe extern "C" fn verify_sync_committee(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit H-5 (#14): null pointer in any input must return -6, not UB.
+    #[test]
+    fn null_pointers_return_minus_six() {
+        let pks: [u8; 48] = [0; 48];
+        let sig: [u8; 96] = [0; 96];
+        let root: [u8; 32] = [0; 32];
+
+        unsafe {
+            assert_eq!(
+                verify_sync_committee(std::ptr::null(), 48, sig.as_ptr(), root.as_ptr()),
+                -6
+            );
+            assert_eq!(
+                verify_sync_committee(pks.as_ptr(), 48, std::ptr::null(), root.as_ptr()),
+                -6
+            );
+            assert_eq!(
+                verify_sync_committee(pks.as_ptr(), 48, sig.as_ptr(), std::ptr::null()),
+                -6
+            );
+        }
+    }
+}
