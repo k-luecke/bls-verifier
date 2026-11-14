@@ -5,7 +5,7 @@ Ethereum sync committee signature verification. One C-FFI function in a
 small Rust crate, compiled to either a native cdylib or a wasm32 module
 for the HyperBEAM device.
 
-> **Verifies one thing well; the layers above it do the rest.**
+> **Verifies one thing well; the layers above it do the rest.** Part of the [Paxiom](https://paxiom.org) verification stack (see also [`k-luecke/paxiom-static`](https://github.com/k-luecke/paxiom-static) and [`k-luecke/paxiom`](https://github.com/k-luecke/paxiom)).
 
 ## Workspace
 
