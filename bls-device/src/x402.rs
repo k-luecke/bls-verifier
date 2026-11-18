@@ -88,11 +88,20 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// A response with `isValid: true` but a missing or blank `payer` is
 /// rejected as `x402_valid_missing_payer` — we never invent a success
 /// identifier.
-#[derive(Debug)]
 pub struct HttpX402 {
     facilitator_url: String,
     bearer: String,
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpX402 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpX402")
+            .field("facilitator_url", &self.facilitator_url)
+            .field("bearer", &"[REDACTED]")
+            .field("http", &self.http)
+            .finish()
+    }
 }
 
 impl HttpX402 {
@@ -397,5 +406,25 @@ mod tests {
             .await;
         let client = client_for(server.uri());
         assert_eq!(client.verify(body, &[0u8; 32]).await, Ok("0xabc".into()));
+    }
+
+    #[test]
+    fn debug_impl_redacts_bearer_token() {
+        let secret = "super-secret-cdp-bearer-token-9999";
+        let client =
+            HttpX402::new("https://example.test/verify".into(), secret.into()).unwrap();
+        let formatted = format!("{client:?}");
+        assert!(
+            formatted.contains("https://example.test/verify"),
+            "expected facilitator_url in Debug output, got: {formatted}"
+        );
+        assert!(
+            formatted.contains("[REDACTED]"),
+            "expected [REDACTED] placeholder in Debug output, got: {formatted}"
+        );
+        assert!(
+            !formatted.contains(secret),
+            "Debug output leaked raw bearer token: {formatted}"
+        );
     }
 }
